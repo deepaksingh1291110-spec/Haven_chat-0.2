@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  =====================================================================
+  AndroidManifest.xml  (app/src/main/)
+  WHAT: The app's "ID card" for Android. It says what the app is called,
+        which screen opens first, and which permissions it needs.
+  =====================================================================
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- PERMISSION: read model files (GGUF) from a normal phone folder,
+         for example /storage/emulated/0/HavenModels/.
+         Android 10 and older use READ_EXTERNAL_STORAGE. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- PERMISSION: "All files access" for Android 11 and newer.
+         The user turns it on once in phone settings. This is what your
+         Settings screen means by "Storage Status: Allowed". -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="Haven Chat"
+        android:allowBackup="true"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <!-- The theme above is a plain built-in one with no top bar.
+             Our real look (colors, dark/light) is drawn by Jetpack Compose
+             inside MainActivity, so we do not need a custom XML theme. -->
+
+        <!-- MainActivity = the one and only Android "screen" (Activity).
+             All our screens (chat, drawer, settings) live INSIDE it as
+             Compose screens. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- adjustResize: the chat input bar moves up with the keyboard. -->
+
+            <!-- This block marks it as the screen that opens when the user
+                 taps the app icon. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

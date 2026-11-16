@@ -1,0 +1,51 @@
+# =====================================================================
+# build.yml  (.github/workflows/)
+# WHAT: Tells GitHub Actions (free cloud computer) how to build the APK.
+# WHEN: Runs every time you push code to the "main" branch.
+#       You can also run it by hand: Actions tab > Build APK > Run workflow.
+# RESULT: A downloadable APK in the run's "Artifacts" section.
+# =====================================================================
+
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]       # run on every push to main
+  workflow_dispatch:         # also allow a manual "Run workflow" button
+
+jobs:
+  build:
+    # A fresh Linux computer from GitHub (has the Android SDK installed).
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: download our code from the repo.
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      # Step 2: install Java 17 (Android builds need Java).
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Step 3: install Gradle. We install it here, so our repo does not
+      # need the gradle wrapper files (which are hard to make on a phone).
+      # Version 8.10.2 works with the Android plugin 8.7.3 in build.gradle.kts.
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      # Step 4: build the debug APK. If it fails, open this step in the
+      # Actions log and copy the red error text to Claude.
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      # Step 5: save the APK so you can download it from the run page.
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HavenChat-debug-apk
+          path: app/build/outputs/apk/debug/*.apk

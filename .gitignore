@@ -1,0 +1,31 @@
+# =====================================================================
+# .gitignore  (project ROOT folder)
+# WHAT: Lists files git must NOT upload to GitHub.
+# WHY:  Build output is huge and can be rebuilt. Secrets must stay private.
+# =====================================================================
+
+# Build output (rebuilt by GitHub Actions every time)
+build/
+.gradle/
+*.apk
+*.aab
+
+# Local machine settings (different on every computer)
+local.properties
+.idea/
+*.iml
+
+# Secrets: never upload signing keys
+*.jks
+*.keystore
+
+# AI model files are huge. They live on the phone, not in git.
+*.gguf
+
+# Native build cache (used later in Phase 2)
+.cxx/
+.externalNativeBuild/
+
+# Termux / OS junk
+.DS_Store
+*.log
