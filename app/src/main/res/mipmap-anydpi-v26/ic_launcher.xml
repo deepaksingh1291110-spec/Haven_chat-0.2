@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  =====================================================================
+  ic_launcher.xml  (app/src/main/res/mipmap-anydpi-v26/)
+  WHAT: Defines the app icon as an "adaptive icon": two layers that
+        Android stacks and crops into a circle or rounded square,
+        depending on the phone's launcher.
+          background = solid dark color (ic_launcher_background.xml)
+          foreground = your logo picture (ic_launcher_foreground.png)
+  WHY THE FOLDER NAME: "anydpi-v26" means "any screen density, Android 8
+        and newer". Our minSdk is 26, so this covers every supported phone.
+  =====================================================================
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

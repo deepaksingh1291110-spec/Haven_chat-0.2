@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  =====================================================================
+  ic_launcher_background.xml  (app/src/main/res/values/)
+  WHAT: The solid color BEHIND the logo in the app icon.
+        It matches the dark background of your Haven Chat logo.
+  TIP:  If the logo edges look different from this color, change the
+        number below (format: #RRGGBB).
+  =====================================================================
+-->
+<resources>
+    <color name="ic_launcher_background">#12161C</color>
+</resources>
