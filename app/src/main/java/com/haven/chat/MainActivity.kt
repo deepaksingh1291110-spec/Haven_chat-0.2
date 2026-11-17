@@ -2,7 +2,8 @@
 // MainActivity.kt  (app/src/main/java/com/haven/chat/)
 // WHAT: The first and only Android screen (Activity). It starts when
 //       the user taps the app icon (see AndroidManifest.xml).
-// JOBS: 1) Draw the whole app: HavenApp() in our theme.
+// JOBS: 1) Show the splash: first Android's black system splash, then
+//          our own picture (HavenSplash), then the real app (HavenApp).
 //       2) Check and request the "All files access" permission, which
 //          the app needs to read model files (GGUF) from the phone.
 //          Only an Activity can do this, so it lives here and not in
@@ -26,10 +27,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.haven.chat.ui.HavenApp
+import com.haven.chat.ui.splash.HavenSplash
 import com.haven.chat.ui.theme.HavenChatTheme
 
 class MainActivity : ComponentActivity() {
@@ -48,6 +52,12 @@ class MainActivity : ComponentActivity() {
 
     // onCreate runs ONE time when the screen starts.
     override fun onCreate(savedInstanceState: Bundle?) {
+        // IMPORTANT: this line must come BEFORE super.onCreate.
+        // It switches from the splash theme (Theme.Haven.Splash) to the
+        // normal theme once the app is ready. Without it, the app would
+        // stay stuck on the black splash.
+        installSplashScreen()
+
         super.onCreate(savedInstanceState)
 
         // Draw behind the status bar and navigation bar (full-screen look).
@@ -60,10 +70,21 @@ class MainActivity : ComponentActivity() {
         setContent {
             HavenChatTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    HavenApp(
-                        storageAllowed = storageAllowed,
-                        onRequestStorageAccess = { requestStorageAccess() }
-                    )
+
+                    // true = show our splash picture, false = show the app.
+                    // "rememberSaveable" keeps the value when the phone is
+                    // rotated, so the splash does not play a second time.
+                    var showSplash by rememberSaveable { mutableStateOf(true) }
+
+                    if (showSplash) {
+                        // After 2 seconds the splash calls this lambda.
+                        HavenSplash(onFinished = { showSplash = false })
+                    } else {
+                        HavenApp(
+                            storageAllowed = storageAllowed,
+                            onRequestStorageAccess = { requestStorageAccess() }
+                        )
+                    }
                 }
             }
         }

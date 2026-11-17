@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  themes.xml  (app/src/main/res/values/)
+  WHAT: The tiny SYSTEM splash: a plain black screen Android shows for a
+        split second while the app starts. Your real splash picture
+        (splash_screen.png) is shown right after by our own code.
+  Needs the library androidx.core:core-splashscreen (added in step 26).
+-->
+<resources>
+    <style name="Theme.Haven.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#000000</item>
+        <item name="windowSplashScreenAnimatedIcon">@android:color/transparent</item>
+        <item name="postSplashScreenTheme">@android:style/Theme.Material.NoActionBar</item>
+    </style>
+</resources>
