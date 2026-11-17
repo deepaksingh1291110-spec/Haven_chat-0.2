@@ -66,12 +66,23 @@ object EngineManager {
     var answering by mutableStateOf(false)
         private set
 
+    // True from the moment the FIRST piece of thinking text arrives.
+    // Together with "answering" this gives three phases while busy:
+    //   neither flag  -> "Reading..."  (Gemma reads your message and the old chat)
+    //   thinkingSeen  -> "Thinking..." (thinking text is arriving)
+    //   answering     -> "Writing..." (the real answer is arriving)
+    var thinkingSeen by mutableStateOf(false)
+        private set
+
     /** Short text for the status chip, for example "Ready" or "Loading...". */
     fun statusText(): String = when (state) {
         State.NOT_LOADED -> "Not loaded"
         State.LOADING -> "Loading..."
         State.READY -> "Ready"
-        State.THINKING -> if (answering) "Writing..." else "Thinking..."
+        State.THINKING ->
+            if (answering) "Writing..."
+            else if (thinkingSeen) "Thinking..."
+            else "Reading..."
         State.ERROR -> "Error"
     }
 
@@ -118,8 +129,11 @@ object EngineManager {
         onMain {
             state = newState
             errorMessage = message
-            // Any state other than THINKING means the answer phase is over.
-            if (newState != State.THINKING) answering = false
+            // Any state other than THINKING means the busy phases are over.
+            if (newState != State.THINKING) {
+                answering = false
+                thinkingSeen = false
+            }
         }
     }
 
@@ -241,7 +255,8 @@ object EngineManager {
         }
 
         stopRequested = false
-        answering = false            // a new turn starts in the "thinking" phase
+        answering = false            // a new turn starts in the "reading" phase
+        thinkingSeen = false
         setState(State.THINKING)
 
         worker.execute {
@@ -258,6 +273,8 @@ object EngineManager {
                     val piece = String(bytes, Charsets.UTF_8)
                     onMain {
                         if (kind == ChatListener.THINKING) {
+                            // First thinking text: the chip changes to "Thinking...".
+                            thinkingSeen = true
                             onThinking(piece)
                         } else {
                             // First answer text: the chip changes to "Writing...".

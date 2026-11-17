@@ -17,6 +17,8 @@
 //     stay on the Settings page so the button text can be watched.
 //   - The Browse file picker now lives inside SettingsScreen, so the
 //     onBrowseClick line is gone.
+//   - Stop button: ChatScreen gets isGenerating (read from the engine
+//     state) and onStop (calls chatViewModel.stopGenerating()).
 // =====================================================================
 package com.haven.chat.ui
 
@@ -118,7 +120,11 @@ fun HavenApp(
                         if (s == EngineManager.State.NOT_LOADED || s == EngineManager.State.ERROR) {
                             settingsViewModel.loadModel()
                         }
-                    }
+                    },
+                    // Stop button: while Gemma is busy (reading, thinking or
+                    // writing) the send button turns into "stop".
+                    isGenerating = EngineManager.state == EngineManager.State.THINKING,
+                    onStop = { chatViewModel.stopGenerating() }
                 )
             }
         }

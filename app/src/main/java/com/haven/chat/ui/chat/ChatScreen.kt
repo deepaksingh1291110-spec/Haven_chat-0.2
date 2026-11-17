@@ -14,6 +14,8 @@
 //     what a tap does (HavenApp loads the model when it is not loaded).
 //   - The list now also scrolls DOWN while an answer is being streamed,
 //     not only when a new message is added.
+//   - Stop button: isGenerating and onStop are passed on to the input bar,
+//     where the send button turns into a stop button while Gemma works.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -63,7 +65,9 @@ fun ChatScreen(
     onMenuClick: () -> Unit,            // user tapped the menu icon (open drawer)
     onNewChatClick: () -> Unit,         // user tapped the pencil icon
     onOptionsClick: () -> Unit,         // user tapped the tune icon in the input bar
-    onStatusClick: () -> Unit = {}      // user tapped the status chip (default: do nothing)
+    onStatusClick: () -> Unit = {},     // user tapped the status chip (default: do nothing)
+    isGenerating: Boolean = false,      // true while Gemma is busy (the send button becomes "stop")
+    onStop: () -> Unit = {}             // user tapped the stop button
 ) {
     // Remembers the scroll position of the message list.
     val listState = rememberLazyListState()
@@ -122,6 +126,9 @@ fun ChatScreen(
             ChatInputBar(
                 onSend = onSend,
                 onOptionsClick = onOptionsClick,
+                // The round button shows "stop" while Gemma is busy.
+                isGenerating = isGenerating,
+                onStop = onStop,
                 // navigationBarsPadding: stay above the phone's gesture bar.
                 // imePadding: move up when the keyboard opens.
                 modifier = Modifier

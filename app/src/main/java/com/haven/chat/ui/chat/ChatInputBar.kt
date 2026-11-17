@@ -1,10 +1,17 @@
 // =====================================================================
 // ChatInputBar.kt  (app/src/main/java/com/haven/chat/ui/chat/)
 // WHAT: The rounded message box at the bottom of the chat screen:
-//         [ tune icon ] [ Message Haven... ] [ round send button ]
+//         [ tune icon ] [ Message Haven... ] [ round send / stop button ]
 // HOW:  It keeps the typed text inside itself. When you tap send, it
 //       gives the text to the caller (onSend) and clears the box.
-// USED BY: ChatScreen (a later file).
+//
+// PHASE 2 CHANGE (stop button): the round button on the right has TWO jobs.
+//   - Gemma is idle:   up arrow  = send the message (needs some text).
+//   - Gemma is busy:   stop square = stop the answer (always active).
+//   It is the same button; only its icon and action change.
+//   The caller tells us which one with "isGenerating" and "onStop".
+//   Both have defaults, so older code that does not pass them still works.
+// USED BY: ChatScreen.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -16,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -41,7 +49,9 @@ import com.haven.chat.ui.theme.SendButtonBlue
 fun ChatInputBar(
     onSend: (String) -> Unit,          // called with the text when user taps send
     onOptionsClick: () -> Unit,        // called when user taps the tune icon
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isGenerating: Boolean = false,     // true while Gemma is reading, thinking or writing
+    onStop: () -> Unit = {}            // called when the user taps stop
 ) {
     // The text the user is typing. "remember" keeps it alive while the
     // screen is shown; "mutableStateOf" redraws the bar when it changes.
@@ -71,6 +81,8 @@ fun ChatInputBar(
         }
 
         // MIDDLE: the text field. weight(1f) = take all free width.
+        // You can still type the next message while Gemma is answering;
+        // sending is blocked until the answer ends (the button is "stop").
         TextField(
             value = text,
             onValueChange = { text = it },          // store every typed letter
@@ -94,13 +106,19 @@ fun ChatInputBar(
             )
         )
 
-        // RIGHT: round send button. Grayed out when there is no text.
+        // RIGHT: ONE round button with two jobs.
+        //   isGenerating = true  -> shows a stop square, always active, calls onStop().
+        //   isGenerating = false -> shows an up arrow, active only with text, sends.
         FilledIconButton(
             onClick = {
-                onSend(text.trim())                  // give text to the caller
-                text = ""                            // clear the box
+                if (isGenerating) {
+                    onStop()                         // stop the running answer
+                } else {
+                    onSend(text.trim())              // give text to the caller
+                    text = ""                        // clear the box
+                }
             },
-            enabled = canSend,
+            enabled = isGenerating || canSend,
             modifier = Modifier.size(44.dp),
             colors = IconButtonDefaults.filledIconButtonColors(
                 containerColor = SendButtonBlue,
@@ -110,8 +128,8 @@ fun ChatInputBar(
             )
         ) {
             Icon(
-                imageVector = Icons.Filled.ArrowUpward,
-                contentDescription = "Send"
+                imageVector = if (isGenerating) Icons.Filled.Stop else Icons.Filled.ArrowUpward,
+                contentDescription = if (isGenerating) "Stop" else "Send"
             )
         }
     }
