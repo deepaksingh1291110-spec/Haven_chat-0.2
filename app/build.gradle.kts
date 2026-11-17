@@ -5,12 +5,19 @@
 //
 // PHASE 2 changes (marked "PHASE 2"): the C++ engine (llama.cpp) is now
 // built together with the app using the Android NDK and CMake.
+//
+// PHASE 3 changes (marked "PHASE 3"): three things were added.
+//   1) The KSP plugin is switched on (first block below).
+//   2) Room = the database library (SQLite) for chats and messages.
+//   3) DataStore = a small saved key/value store for the settings.
+// Nothing else in this file was changed.
 // =====================================================================
 
 plugins {
     id("com.android.application")                 // builds the APK
     id("org.jetbrains.kotlin.android")            // Kotlin language
     id("org.jetbrains.kotlin.plugin.compose")     // Jetpack Compose UI
+    id("com.google.devtools.ksp")                 // PHASE 3: lets Room write database code
 }
 
 android {
@@ -134,6 +141,25 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.5")
     // ViewModel = keeps screen data alive when the phone rotates
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+
+    // ---------------- PHASE 3 (NEW) ----------------
+
+    // ROOM = the database (SQLite) for chats and messages.
+    //   room-runtime : the library itself.
+    //   room-ktx     : lets the database work with Kotlin coroutines and
+    //                  Flow (so the drawer list updates BY ITSELF when a
+    //                  chat is added, renamed or deleted).
+    //   room-compiler: the code writer. It runs at BUILD time through KSP
+    //                  (that is why it says "ksp" and not "implementation").
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
+
+    // DATASTORE = saves the settings (threads, context, system prompt...)
+    // on the phone, so they are still there after the app is closed.
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+
+    // ---------------- END PHASE 3 ----------------
 
     // Debug-only: lets Android Studio preview the UI. Not in the APK logic.
     debugImplementation("androidx.compose.ui:ui-tooling")

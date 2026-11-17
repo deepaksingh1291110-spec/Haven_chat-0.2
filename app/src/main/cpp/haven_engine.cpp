@@ -6,6 +6,13 @@
 //
 // All functions are called from ONE background thread in Kotlin, except
 // stop(), which only sets a flag.
+//
+// PHASE 3 CHANGE (the only change in this file):
+//   New function countTokens(text) near the end of the "Chat" part.
+//   It tells Kotlin EXACTLY how many tokens a text has for the loaded
+//   main model (Gemma). The app uses it to decide how many old messages
+//   fit into the context window when an old chat is opened.
+//   Nothing else in this file was changed.
 
 #include <android/log.h>
 #include <jni.h>
@@ -742,6 +749,30 @@ JNIEXPORT jstring JNICALL
 Java_com_haven_chat_LlamaBridge_lastLog(JNIEnv * env, jobject) {
     std::lock_guard<std::mutex> lock(g_log_mu);
     return ascii_jstring(env, g_log_buf);
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 3 (NEW): count tokens
+// ---------------------------------------------------------------------------
+
+// Counts how many tokens a text has for the loaded MAIN model (Gemma).
+// WHY: when an old chat is opened, the app must know how many old messages fit
+//      into the context window. Guessing from the number of letters is not exact;
+//      this is exact because it uses Gemma's own tokenizer.
+// The text is UTF-8 bytes. Nothing is stored and the conversation is not touched.
+// Returns the number of tokens, or -1 when no model is loaded (the app then
+// falls back to a safe guess of 1 token per 3 characters).
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_countTokens(JNIEnv * env, jobject, jbyteArray jtext) {
+    if (!g_model) { return -1; }
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    const std::string text = bytes_to_std(env, jtext);
+    if (text.empty()) { return 0; }
+    // add_special = false: we count only the text itself (no start-of-text token).
+    // parse_special = false: words that look like special markers are plain text,
+    // exactly like in generate() for text that comes from the user.
+    const std::vector<llama_token> t = common_tokenize(vocab, text, /*add_special*/ false, /*parse_special*/ false);
+    return (jint) t.size();
 }
 
 // ---------------------------------------------------------------------------

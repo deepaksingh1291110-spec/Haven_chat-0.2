@@ -2,7 +2,8 @@
 // SettingsScreen.kt  (app/src/main/java/com/haven/chat/ui/settings/)
 // WHAT: The settings screen from your design:
 //         top bar:  [back]  Settings            [Save & Reload]
-//         card:     Model Configuration (threads, context, thinking)
+//         card:     Model Configuration (threads, context, thinking,
+//                   auto-name chats)
 //         field:    model file path + Browse button
 //         card:     Storage Status (file access allowed or not)
 //         button:   Load Model
@@ -21,6 +22,17 @@
 //     saved settings. So onLoadModel receives the draft.
 //   - onBrowseClick is gone: the picker lives inside this file.
 //
+// PHASE 3 CHANGES (marked "PHASE 3"):
+//   - New setting "Auto-name chats" (default OFF): a switch in the
+//     Model Configuration card. AppSettings has a new field autoNameChats.
+//   - More context window sizes for phones with a lot of RAM:
+//     2048, 4096, 8192, 16384 and 32768. The chips wrap to a second
+//     line if they do not fit. The RAM warning now also covers 16384+.
+//   - The Load Model button is also switched off while Gemma is naming
+//     a chat (the engine is busy then).
+//   - Saving to disk is NOT done here. SettingsViewModel does it (next
+//     files), so this screen stays simple.
+//
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
 // =====================================================================
@@ -35,6 +47,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -61,6 +75,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -89,17 +104,22 @@ const val DEFAULT_MODEL_PATH = "/storage/emulated/0/HavenModels/gemma4-e2b-q4_0.
 private const val MAX_PROMPT_CHARS = 2000   // longest allowed system prompt
 private const val MAX_STOP_CHARS = 100      // longest allowed stop sequence
 
+// PHASE 3: the context window sizes the user can choose.
+// The big ones (16384, 32768) are for phones with a lot of RAM.
+private val CONTEXT_SIZES = listOf(2048, 4096, 8192, 16384, 32768)
+
 // ---------------------------------------------------------------------
 // All user settings in ONE container. "copy(...)" makes a new copy with
 // one value changed (the old one is never edited in place).
 // ---------------------------------------------------------------------
 data class AppSettings(
     val threads: Int = 4,                          // CPU threads (1 to 6)
-    val contextSize: Int = 4096,                   // 2048, 4096 or 8192
+    val contextSize: Int = 4096,                   // one of CONTEXT_SIZES
     val thinkingEnabled: Boolean = true,           // show the AI's thinking
     val modelPath: String = DEFAULT_MODEL_PATH,    // where the GGUF file is
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
-    val stopSequence: String = DEFAULT_STOP_SEQUENCE
+    val stopSequence: String = DEFAULT_STOP_SEQUENCE,
+    val autoNameChats: Boolean = false             // PHASE 3: let Gemma title new chats (default OFF)
 )
 
 // ---------------------------------------------------------------------
@@ -129,7 +149,8 @@ private fun pathFromPickedUri(uri: Uri): String? {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+// ExperimentalLayoutApi is needed for FlowRow (chips that wrap to a new line).
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     initial: AppSettings,                    // settings when the screen opens
@@ -227,10 +248,15 @@ fun SettingsScreen(
                 )
 
                 // --- Context window chips ---
+                // PHASE 3: five sizes now. FlowRow puts the chips side by side
+                // and moves the ones that do not fit to the next line.
                 Text("Context window", style = MaterialTheme.typography.bodyMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
                     // Draw one chip for each allowed size.
-                    listOf(2048, 4096, 8192).forEach { size ->
+                    CONTEXT_SIZES.forEach { size ->
                         FilterChip(
                             selected = draft.contextSize == size,
                             onClick = { draft = draft.copy(contextSize = size) },
@@ -238,8 +264,15 @@ fun SettingsScreen(
                         )
                     }
                 }
-                // RAM warning from your project notes (Android can kill the app).
-                if (draft.contextSize == 8192) {
+                // RAM warnings (Android can kill the app when RAM runs out).
+                if (draft.contextSize >= 16384) {
+                    Text(
+                        text = "${draft.contextSize} needs a phone with a lot of free RAM. " +
+                                "The app may be closed by Android.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                } else if (draft.contextSize == 8192) {
                     Text(
                         text = "8192 uses much more RAM. The app may be closed by Android.",
                         style = MaterialTheme.typography.bodySmall,
@@ -259,6 +292,31 @@ fun SettingsScreen(
                         selected = !draft.thinkingEnabled,
                         onClick = { draft = draft.copy(thinkingEnabled = false) },
                         label = { Text("Standard") }
+                    )
+                }
+
+                // --- PHASE 3: Auto-name chats switch ---
+                // OFF (default): a new chat gets the first words of your
+                // first message as its title, instantly.
+                // ON: after the first answer, Gemma writes a better title in
+                // the background (a few seconds; the input is locked while
+                // it works).
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Auto-name chats", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = "Gemma writes a short title after the first answer.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = draft.autoNameChats,
+                        onCheckedChange = { draft = draft.copy(autoNameChats = it) }
                     )
                 }
             }
@@ -321,11 +379,13 @@ fun SettingsScreen(
 
             // ================= LOAD MODEL BUTTON =================
             // The button text follows the real engine status.
-            // It is switched off while loading or while Gemma is answering.
+            // It is switched off while loading, while Gemma is answering
+            // and (PHASE 3) while Gemma is naming a chat.
             Button(
                 onClick = { onLoadModel(draft) },
                 enabled = engineState != EngineManager.State.LOADING &&
-                          engineState != EngineManager.State.THINKING,
+                          engineState != EngineManager.State.THINKING &&
+                          engineState != EngineManager.State.NAMING,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp)
@@ -343,6 +403,7 @@ fun SettingsScreen(
                         EngineManager.State.LOADING -> "Loading model..."
                         EngineManager.State.READY -> "Model loaded (tap to reload)"
                         EngineManager.State.THINKING -> "Gemma is answering..."
+                        EngineManager.State.NAMING -> "Naming chat..."
                         else -> "Load Model"
                     },
                     style = MaterialTheme.typography.labelLarge

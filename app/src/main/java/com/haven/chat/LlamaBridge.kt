@@ -21,6 +21,12 @@ data class ToolCall(val id: String, val name: String, val argumentsJson: String)
  * Kotlin side of the native engine (haven_engine.cpp).
  * Create ONE instance and call everything from ONE background thread,
  * except stop(), which may be called from any thread.
+ *
+ * PHASE 3 CHANGE (the only change in this file):
+ *   New function countTokens(). It is the Kotlin side of the C++ function
+ *   Java_com_haven_chat_LlamaBridge_countTokens that already exists in
+ *   haven_engine.cpp. Without this line the C++ function can never be
+ *   called. Nothing else in this file was changed.
  */
 class LlamaBridge {
 
@@ -74,6 +80,20 @@ class LlamaBridge {
 
     /** Adds the result of a tool call. Then call generate with an empty text. */
     external fun addToolResult(callId: String, name: String, content: ByteArray)
+
+    // PHASE 3 (NEW) ------------------------------------------------------------
+
+    /**
+     * Counts EXACTLY how many tokens a text has for the loaded main model
+     * (Gemma's own tokenizer). Text is UTF-8 bytes.
+     * Returns -1 when no model is loaded (the caller then uses a safe guess).
+     * WHY: when an old chat is opened, the app adds old messages newest to
+     * oldest until the context window is full. It needs exact sizes.
+     * Like the other engine calls: ONE background thread only.
+     */
+    external fun countTokens(text: ByteArray): Int
+
+    // END PHASE 3 --------------------------------------------------------------
 
     private external fun lastContent(): ByteArray
     private external fun lastReasoning(): ByteArray

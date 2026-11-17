@@ -19,8 +19,23 @@
 // STATUS: "state" is Compose state. When it changes, any screen that
 //       reads it redraws by itself (the chip under the chat title).
 //
-// NOT USED HERE (on purpose, Phase 2 first version):
-//       Agent, tools, memory. Plain chat with Gemma only.
+// NOT USED HERE (on purpose): Agent, tools, memory (that is Phase 4).
+//
+// ---------------------------------------------------------------------
+// PHASE 3 CHANGES (everything new is marked "PHASE 3"):
+//   1) New state NAMING: Gemma is writing a chat title in the background.
+//   2) openChat(): puts an OLD chat back into Gemma's head. It adds the
+//      newest messages that fit into the context window (counted exactly
+//      with countTokens), and leaves a reserve for the reply.
+//   3) historyProvider + load(): after the model is (re)loaded, the chat
+//      that is open on screen is replayed automatically, so reloading
+//      the model in Settings does not make Gemma forget the chat.
+//   4) generateTitle(): the hidden title request (thinking OFF, max 16
+//      tokens, output never shown). Afterwards the conversation inside
+//      the engine is restored, so the title question never leaks into
+//      the real chat.
+//   5) contextSize is remembered after loading.
+// Everything else works as before.
 // =====================================================================
 package com.haven.chat.engine
 
@@ -44,6 +59,7 @@ object EngineManager {
         LOADING,      // reading the GGUF file into RAM (can take a while)
         READY,        // model loaded, waiting for a question
         THINKING,     // Gemma is writing an answer right now
+        NAMING,       // PHASE 3: Gemma is writing a chat title (hidden, short)
         ERROR         // something failed; see errorMessage
     }
 
@@ -83,8 +99,30 @@ object EngineManager {
             if (answering) "Writing..."
             else if (thinkingSeen) "Thinking..."
             else "Reading..."
+        State.NAMING -> "Naming chat..."      // PHASE 3
         State.ERROR -> "Error"
     }
+
+    /** PHASE 3: true while the engine cannot take a new job (loading, answering or naming). */
+    val isBusy: Boolean
+        get() = state == State.LOADING || state == State.THINKING || state == State.NAMING
+
+    // -----------------------------------------------------------------
+    // PHASE 3: one old message, handed over by the ChatViewModel
+    // -----------------------------------------------------------------
+    /**
+     * isUser = true for your message, false for Gemma's answer.
+     * text   = only the visible text (never the thinking text).
+     */
+    class HistoryItem(val isUser: Boolean, val text: String)
+
+    /**
+     * PHASE 3: set by ChatViewModel. It returns the messages of the chat that
+     * is open on screen RIGHT NOW (oldest first). load() reads it, so that
+     * after a model reload the open chat is put back into Gemma's head.
+     * null = nothing to replay (a fresh chat).
+     */
+    @Volatile var historyProvider: (() -> List<HistoryItem>)? = null
 
     // -----------------------------------------------------------------
     // Result of one generate() call
@@ -97,6 +135,29 @@ object EngineManager {
         val stopped: Boolean,             // true if the user pressed stop
         val error: String?                // plain-words problem, or null if all went well
     )
+
+    // -----------------------------------------------------------------
+    // PHASE 3: numbers used when an old chat is put back into Gemma
+    // -----------------------------------------------------------------
+
+    // Room kept free for Gemma's NEXT reply (in tokens). Thinking needs more.
+    private const val REPLY_RESERVE_THINKING = 1000
+    private const val REPLY_RESERVE_NORMAL = 500
+
+    // Room kept free for your NEXT message plus the chat-template markers.
+    // (We cannot know how long your next message will be, so we guess.)
+    private const val NEXT_USER_MESSAGE_ROOM = 300
+
+    // Every message costs a few extra tokens for the template markers.
+    private const val PER_MESSAGE_OVERHEAD = 8
+
+    // The hidden title request.
+    private const val TITLE_MAX_TOKENS = 16
+    private const val TITLE_MAX_CHARS = 60
+    private const val TITLE_PROMPT =
+        "Write a short title for this conversation, at most 6 words, " +
+        "in the same language as my first message. " +
+        "Reply with the title only: no quotes, no full stop."
 
     // -----------------------------------------------------------------
     // Private parts
@@ -118,6 +179,9 @@ object EngineManager {
     // Set to true when the user presses stop. The streaming listener
     // reads it and tells the C++ code to finish.
     @Volatile private var stopRequested = false
+
+    // PHASE 3: the context size the model was loaded with (0 = nothing loaded).
+    @Volatile private var loadedContext = 0
 
     // Run something on the main thread (now if we are already there).
     private fun onMain(block: () -> Unit) {
@@ -167,15 +231,23 @@ object EngineManager {
      * Loads the model. If another model is loaded, it is unloaded first.
      * onDone(null) = success, onDone("text") = the problem in plain words.
      * onDone always runs on the main thread.
+     *
+     * PHASE 3: after a successful load, the chat that is open on screen
+     * (historyProvider) is replayed into the engine, newest messages first
+     * until the context is full. "thinking" only decides how much room is
+     * kept for the reply (1000 tokens with thinking, 500 without).
+     * It has a default value, so older calls without it still work.
      */
     fun load(
         path: String,
         contextSize: Int,
         threads: Int,
         systemPrompt: String,
+        thinking: Boolean = true,
         onDone: (String?) -> Unit
     ) {
-        if (state == State.LOADING || state == State.THINKING) {
+        // PHASE 3: "isBusy" now also covers NAMING.
+        if (isBusy) {
             onDone("The engine is busy. Wait a moment and try again.")
             return
         }
@@ -198,6 +270,14 @@ object EngineManager {
         modelName = file.nameWithoutExtension
         setState(State.LOADING)
 
+        // PHASE 3: take a copy of the open chat NOW, on the main thread
+        // (the screen's data must not be read from the worker thread).
+        val history: List<HistoryItem> = try {
+            historyProvider?.invoke() ?: emptyList()
+        } catch (t: Throwable) {
+            emptyList()
+        }
+
         worker.execute {
             val b = bridge
             if (b == null) {
@@ -208,6 +288,7 @@ object EngineManager {
             }
             try {
                 b.unload()   // free an older model if there is one
+                loadedContext = 0
                 val rc = b.loadModel(path, contextSize, threads)
                 if (rc != 0) {
                     val why = when (rc) {
@@ -219,8 +300,10 @@ object EngineManager {
                     setState(State.ERROR, msg.trim())
                     onMain { onDone(msg.trim()) }
                 } else {
-                    // Start an empty conversation with the system prompt.
-                    b.resetChat(systemPrompt.toByteArray(Charsets.UTF_8))
+                    loadedContext = contextSize
+                    // Start the conversation with the system prompt, and
+                    // (PHASE 3) put the open chat back, as much as fits.
+                    replayOnWorker(b, systemPrompt, history, thinking)
                     setState(State.READY)
                     onMain { onDone(null) }
                 }
@@ -230,6 +313,109 @@ object EngineManager {
                 onMain { onDone(msg) }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // PHASE 3: openChat: put an OLD chat into Gemma's head
+    // -----------------------------------------------------------------
+    /**
+     * Call this when the user taps an old chat in the drawer.
+     * history = the chat's messages, oldest first.
+     *
+     * What it does: starts a clean conversation with the system prompt, then
+     * adds the NEWEST messages that fit into the context window. Older ones
+     * stay in the database and on screen, Gemma just does not re-read them.
+     *
+     * onDone (main thread) gets:
+     *   n >= 0 : n messages were put into Gemma's head
+     *   -1     : the engine is busy, nothing was done (try again later)
+     * If no model is loaded yet, nothing is done now and onDone(0) is called:
+     * the chat is replayed automatically when the model is loaded
+     * (see historyProvider).
+     */
+    fun openChat(
+        systemPrompt: String,
+        history: List<HistoryItem>,
+        thinking: Boolean,
+        onDone: (Int) -> Unit
+    ) {
+        when (state) {
+            State.READY -> worker.execute {
+                val b = bridge
+                val n = try {
+                    if (b != null) replayOnWorker(b, systemPrompt, history, thinking) else 0
+                } catch (t: Throwable) {
+                    0
+                }
+                onMain { onDone(n) }
+            }
+            State.NOT_LOADED, State.ERROR -> onDone(0)
+            else -> onDone(-1)    // loading, answering or naming
+        }
+    }
+
+    // Runs ON THE WORKER THREAD. Starts a new conversation and adds the
+    // newest messages that fit. Returns how many messages were added.
+    private fun replayOnWorker(
+        b: LlamaBridge,
+        systemPrompt: String,
+        history: List<HistoryItem>,
+        thinking: Boolean
+    ): Int {
+        // Always start clean (this also empties the old KV cache).
+        b.resetChat(systemPrompt.toByteArray(Charsets.UTF_8))
+        if (history.isEmpty()) return 0
+
+        // How many tokens may the old messages use?
+        //   context window
+        //   - the system prompt
+        //   - room for Gemma's next reply (1000 thinking, 500 normal)
+        //   - room for the user's next message
+        val reserve = if (thinking) REPLY_RESERVE_THINKING else REPLY_RESERVE_NORMAL
+        var budget = loadedContext - tokensOf(b, systemPrompt) - reserve - NEXT_USER_MESSAGE_ROOM
+
+        // Walk from the NEWEST message to the oldest. Stop at the first one
+        // that does not fit (so we never skip a message and keep a gap).
+        val picked = ArrayList<HistoryItem>()
+        var i = history.size - 1
+        while (i >= 0) {
+            val cost = tokensOf(b, history[i].text) + PER_MESSAGE_OVERHEAD
+            if (cost > budget) break
+            budget -= cost
+            picked.add(history[i])
+            i--
+        }
+        picked.reverse()   // back to oldest first
+
+        // Gemma's chat template wants: user, assistant, user, assistant...
+        // Clean up gaps (for example a stopped answer that was never saved).
+        val cleaned = ArrayList<HistoryItem>()
+        for (m in picked) {
+            // Two messages from the same side in a row: keep only the newer.
+            if (cleaned.isNotEmpty() && cleaned[cleaned.size - 1].isUser == m.isUser) {
+                cleaned.removeAt(cleaned.size - 1)
+            }
+            cleaned.add(m)
+        }
+        // Must START with a user message ...
+        while (cleaned.isNotEmpty() && !cleaned[0].isUser) cleaned.removeAt(0)
+        // ... and END with an answer (the next message is a user message).
+        if (cleaned.isNotEmpty() && cleaned[cleaned.size - 1].isUser) {
+            cleaned.removeAt(cleaned.size - 1)
+        }
+
+        for (m in cleaned) {
+            b.appendMessage(if (m.isUser) "user" else "assistant", m.text.toByteArray(Charsets.UTF_8))
+        }
+        return cleaned.size
+    }
+
+    // Exact token count of a text (Gemma's own tokenizer). If the engine
+    // says "no model" (-1), use a safe guess: 1 token per 3 characters.
+    private fun tokensOf(b: LlamaBridge, text: String): Int {
+        if (text.isEmpty()) return 0
+        val n = b.countTokens(text.toByteArray(Charsets.UTF_8))
+        return if (n >= 0) n else text.length / 3 + 1
     }
 
     // -----------------------------------------------------------------
@@ -248,8 +434,11 @@ object EngineManager {
         onDone: (Result) -> Unit
     ) {
         if (state != State.READY) {
-            val msg = if (state == State.THINKING) "Gemma is still answering."
-                      else "No model is loaded. Open Settings and tap Load Model."
+            val msg = when (state) {
+                State.THINKING -> "Gemma is still answering."
+                State.NAMING -> "Gemma is still naming the chat. Try again in a moment."   // PHASE 3
+                else -> "No model is loaded. Open Settings and tap Load Model."
+            }
             onDone(Result("", "", null, null, false, msg))
             return
         }
@@ -318,6 +507,107 @@ object EngineManager {
     }
 
     // -----------------------------------------------------------------
+    // PHASE 3: generateTitle: the hidden "give this chat a name" request
+    // -----------------------------------------------------------------
+    /**
+     * Call this AFTER the first answer of a chat is finished.
+     *   firstUserText = the user's first message
+     *   firstAnswer   = Gemma's first answer (visible text only)
+     *   systemPrompt  = the system prompt in use
+     *
+     * What happens:
+     *   - The state becomes NAMING (the input bar can lock itself).
+     *   - Gemma gets a special title question: thinking OFF, max 16 tokens.
+     *     Nothing is shown on screen; the listener only watches for "stop".
+     *   - When done, the engine's conversation is RESTORED to exactly
+     *     [system prompt, first message, first answer]. So the title
+     *     question never becomes part of the real chat.
+     *   - onDone (main thread) gets the cleaned title, or null when it was
+     *     cancelled, failed or came out empty. The caller keeps a fallback
+     *     title in that case.
+     *
+     * To cancel the naming: call cancelNaming() (or stop()).
+     */
+    fun generateTitle(
+        systemPrompt: String,
+        firstUserText: String,
+        firstAnswer: String,
+        onDone: (String?) -> Unit
+    ) {
+        if (state != State.READY) {
+            onDone(null)
+            return
+        }
+
+        stopRequested = false
+        setState(State.NAMING)
+
+        worker.execute {
+            val b = bridge
+            var title: String? = null
+
+            if (b != null) {
+                try {
+                    // The listener IGNORES the text. It only answers
+                    // "keep going" (true) or "stop" (false).
+                    val listener = object : ChatListener {
+                        override fun onDelta(kind: Int, bytes: ByteArray): Boolean = !stopRequested
+                    }
+                    val stats = b.generate(
+                        TITLE_PROMPT.toByteArray(Charsets.UTF_8),
+                        TITLE_MAX_TOKENS,
+                        false,                       // thinking OFF
+                        listener
+                    )
+                    if (!stats.startsWith("ERROR") && !stats.startsWith("STOPPED") && !stopRequested) {
+                        title = cleanTitle(b.lastAnswer())
+                    }
+                } catch (t: Throwable) {
+                    // Naming is optional: on any problem we just have no title.
+                    title = null
+                }
+
+                // RESTORE the real conversation (also after cancel or error).
+                // After the FIRST answer the chat has only this one exchange,
+                // so putting it back is quick.
+                try {
+                    b.resetChat(systemPrompt.toByteArray(Charsets.UTF_8))
+                    b.appendMessage("user", firstUserText.toByteArray(Charsets.UTF_8))
+                    if (firstAnswer.isNotEmpty()) {
+                        b.appendMessage("assistant", firstAnswer.toByteArray(Charsets.UTF_8))
+                    }
+                } catch (t: Throwable) {
+                    // The next generate() reports real problems.
+                }
+            }
+
+            setState(State.READY)
+            onMain { onDone(title) }
+        }
+    }
+
+    /** PHASE 3: cancels a running title request (same as stop). Safe any time. */
+    fun cancelNaming() {
+        stop()
+    }
+
+    // Turns Gemma's raw title text into a clean one-line title.
+    // Returns null if nothing usable is left.
+    private fun cleanTitle(raw: String): String? {
+        // First non-empty line only.
+        var t = raw.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: return null
+        // Remove quotes, markdown stars and hashes around it.
+        t = t.trim('"', '\'', '`', '*', '#', ' ', '\u201C', '\u201D')
+        // Remove a leading "Title:".
+        if (t.startsWith("title:", ignoreCase = true)) t = t.substring(6).trim()
+        t = t.trim('"', '\'', '`', '*', ' ', '\u201C', '\u201D')
+        // No full stop at the end.
+        t = t.trimEnd('.', '!', ' ')
+        if (t.length > TITLE_MAX_CHARS) t = t.take(TITLE_MAX_CHARS).trimEnd()
+        return if (t.isEmpty()) null else t
+    }
+
+    // -----------------------------------------------------------------
     // 4) stop / newChat / unload
     // -----------------------------------------------------------------
 
@@ -346,6 +636,7 @@ object EngineManager {
             } catch (t: Throwable) {
                 // ignore
             }
+            loadedContext = 0
             setState(State.NOT_LOADED)
         }
     }
