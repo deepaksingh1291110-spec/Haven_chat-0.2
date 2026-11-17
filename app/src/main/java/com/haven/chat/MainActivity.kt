@@ -8,6 +8,10 @@
 //          the app needs to read model files (GGUF) from the phone.
 //          Only an Activity can do this, so it lives here and not in
 //          the UI files. The result is passed down to the UI.
+//       3) PHASE 2: start the native llama.cpp engine ONCE at launch
+//          (EngineManager.init). It only starts the engine; it does
+//          NOT load the model. The model is loaded later, when the user
+//          taps "Load Model" in Settings.
 // =====================================================================
 package com.haven.chat
 
@@ -32,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.haven.chat.engine.EngineManager
 import com.haven.chat.ui.HavenApp
 import com.haven.chat.ui.splash.HavenSplash
 import com.haven.chat.ui.theme.HavenChatTheme
@@ -59,6 +64,13 @@ class MainActivity : ComponentActivity() {
         installSplashScreen()
 
         super.onCreate(savedInstanceState)
+
+        // PHASE 2: start the native engine. "nativeLibraryDir" is the
+        // folder where Android put our C++ libraries (.so files).
+        // EngineManager.init does the work on a background thread and
+        // ignores a second call, so it is safe when the phone rotates
+        // and onCreate runs again.
+        EngineManager.init(applicationInfo.nativeLibraryDir)
 
         // Draw behind the status bar and navigation bar (full-screen look).
         enableEdgeToEdge()
