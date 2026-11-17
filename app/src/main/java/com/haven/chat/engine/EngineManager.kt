@@ -59,12 +59,19 @@ object EngineManager {
     var modelName by mutableStateOf("gemma")
         private set
 
+    // True from the moment the FIRST piece of the real answer arrives until
+    // Gemma is done. While state is THINKING, this tells the two phases
+    // apart: false = still thinking, true = already writing the answer.
+    // (State.THINKING itself means "busy"; it covers both phases.)
+    var answering by mutableStateOf(false)
+        private set
+
     /** Short text for the status chip, for example "Ready" or "Loading...". */
     fun statusText(): String = when (state) {
         State.NOT_LOADED -> "Not loaded"
         State.LOADING -> "Loading..."
         State.READY -> "Ready"
-        State.THINKING -> "Thinking..."
+        State.THINKING -> if (answering) "Writing..." else "Thinking..."
         State.ERROR -> "Error"
     }
 
@@ -111,6 +118,8 @@ object EngineManager {
         onMain {
             state = newState
             errorMessage = message
+            // Any state other than THINKING means the answer phase is over.
+            if (newState != State.THINKING) answering = false
         }
     }
 
@@ -232,6 +241,7 @@ object EngineManager {
         }
 
         stopRequested = false
+        answering = false            // a new turn starts in the "thinking" phase
         setState(State.THINKING)
 
         worker.execute {
@@ -247,7 +257,13 @@ object EngineManager {
                 override fun onDelta(kind: Int, bytes: ByteArray): Boolean {
                     val piece = String(bytes, Charsets.UTF_8)
                     onMain {
-                        if (kind == ChatListener.THINKING) onThinking(piece) else onAnswer(piece)
+                        if (kind == ChatListener.THINKING) {
+                            onThinking(piece)
+                        } else {
+                            // First answer text: the chip changes to "Writing...".
+                            answering = true
+                            onAnswer(piece)
+                        }
                     }
                     // Returning false tells C++ to stop writing.
                     return !stopRequested

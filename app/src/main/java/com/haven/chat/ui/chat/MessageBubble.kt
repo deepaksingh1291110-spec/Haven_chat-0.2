@@ -5,7 +5,17 @@
 //       - AI message    -> dark bubble on the LEFT, with an optional
 //                          collapsible "Thinking process" box and a
 //                          small stats line (e.g. "35.4 t/s • 311 tokens")
-// USED BY: ChatScreen (a later file) calls MessageBubble() once per message.
+// USED BY: ChatScreen calls MessageBubble() once per message.
+//
+// PHASE 2 CHANGES:
+//   - The AI bubble now leaves free space at the RIGHT side, like in
+//     your design (before, it ran to the screen edge).
+//   - The AI answer AND the thinking text are drawn as real Markdown
+//     (bold, lists, code, ...) by MarkdownText (MarkdownText.kt). The
+//     text is redrawn while it streams in, so the formatting appears
+//     live.
+//   - While Gemma has not written anything yet, the bubble shows "...".
+//   - The empty Text that was used as a spacer is now a real Spacer.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -15,7 +25,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -79,15 +91,17 @@ private fun UserBubble(message: ChatMessage) {
 // ---------------------------------------------------------------------
 // AI bubble: dark card on the left. Contains up to 3 parts:
 //   1) Thinking process box (only if the AI has thinking text)
-//   2) The answer text
+//   2) The answer text (drawn as Markdown)
 //   3) Stats line (only if speed and token count are known)
 // ---------------------------------------------------------------------
 @Composable
 private fun AssistantBubble(message: ChatMessage) {
     Row(
+        // start = 16 dp on the left, end = 48 dp on the RIGHT: this is
+        // the free space your design has next to the AI bubble.
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 6.dp),
+            .padding(start = 16.dp, end = 48.dp, top = 6.dp, bottom = 6.dp),
         horizontalArrangement = Arrangement.Start     // keep content on the left
     ) {
         Column(
@@ -100,16 +114,26 @@ private fun AssistantBubble(message: ChatMessage) {
             // Part 1: thinking box. "?.let" means: run only if thinking is not null.
             message.thinking?.let { thinkingText ->
                 ThinkingBox(thinkingText)
-                // Small gap under the box (a Column child with padding).
-                Text(text = "", modifier = Modifier.padding(top = 4.dp))
+                // Small gap under the box.
+                Spacer(modifier = Modifier.height(8.dp))
             }
 
             // Part 2: the answer.
-            Text(
-                text = message.text,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            if (message.text.isEmpty() && message.thinking == null) {
+                // Nothing has arrived yet: show a dim "..." so the bubble is not empty.
+                Text(
+                    text = "...",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                // MarkdownText turns **bold**, lists, `code` ... into real formatting.
+                MarkdownText(
+                    text = message.text,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            }
 
             // Part 3: stats line, only when both numbers exist.
             val speed = message.tokensPerSecond
@@ -166,11 +190,12 @@ private fun ThinkingBox(thinkingText: String) {
         }
 
         // The thinking text slides in only when expanded is true.
+        // It is drawn as Markdown too, so its lists and bold text look right.
         AnimatedVisibility(visible = expanded) {
-            Text(
+            MarkdownText(
                 text = thinkingText,
-                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp)
             )
         }
