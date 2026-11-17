@@ -29,3 +29,7 @@ local.properties
 # Termux / OS junk
 .DS_Store
 *.log
+
+# PHASE 2: llama.cpp is downloaded by the GitHub workflow at build time.
+# It is huge, so it must never be committed.
+third_party/

@@ -4,6 +4,9 @@
 # WHEN: Runs every time you push code to the "main" branch.
 #       You can also run it by hand: Actions tab > Build APK > Run workflow.
 # RESULT: A downloadable APK in the run's "Artifacts" section.
+#
+# PHASE 2 changes: the build now also compiles llama.cpp (C++), so it
+# needs (1) the llama.cpp source and (2) the Android NDK + CMake.
 # =====================================================================
 
 name: Build APK
@@ -13,10 +16,17 @@ on:
     branches: [ main ]       # run on every push to main
   workflow_dispatch:         # also allow a manual "Run workflow" button
 
+env:
+  # The llama.cpp release this app is built with. To upgrade llama.cpp
+  # later, change only this tag. (Same tag as the old, tested v1 app.)
+  LLAMA_TAG: b11871
+
 jobs:
   build:
     # A fresh Linux computer from GitHub (has the Android SDK installed).
     runs-on: ubuntu-latest
+    # The first C++ build is slow (many CPU variants), so allow 90 minutes.
+    timeout-minutes: 90
 
     steps:
       # Step 1: download our code from the repo.
@@ -30,7 +40,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Step 3: install Gradle. We install it here, so our repo does not
+      # Step 3 (NEW): download llama.cpp into third_party/llama.cpp.
+      # We do NOT store llama.cpp in our repo (it is huge). CMakeLists.txt
+      # looks for it exactly in this folder.
+      - name: Get llama.cpp (pinned release)
+        run: git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp third_party/llama.cpp
+
+      # Step 4: install Gradle. We install it here, so our repo does not
       # need the gradle wrapper files (which are hard to make on a phone).
       # Version 8.10.2 works with the Android plugin 8.7.3 in build.gradle.kts.
       - name: Install Gradle
@@ -38,12 +54,22 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      # Step 4: build the debug APK. If it fails, open this step in the
+      # Step 5 (NEW): install the Android NDK (C++ compiler for Android)
+      # and CMake. The versions must match app/build.gradle.kts.
+      - name: Install Android NDK and CMake
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKM=$(ls "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          echo "Using $SDKM (SDK root: $SDK_ROOT)"
+          yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK_ROOT" "ndk;27.2.12479018" "cmake;3.31.6"
+
+      # Step 6: build the debug APK. If it fails, open this step in the
       # Actions log and copy the red error text to Claude.
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
-      # Step 5: save the APK so you can download it from the run page.
+      # Step 7: save the APK so you can download it from the run page.
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

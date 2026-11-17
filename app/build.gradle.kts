@@ -1,7 +1,10 @@
 // =====================================================================
 // app/build.gradle.kts  (inside the "app" folder)
 // WHAT: Build settings for the app module: app name/ID, Android versions,
-//       CPU type, and the LIBRARIES (dependencies) the app uses.
+//       CPU type, the C++ engine build, and the LIBRARIES (dependencies).
+//
+// PHASE 2 changes (marked "PHASE 2"): the C++ engine (llama.cpp) is now
+// built together with the app using the Android NDK and CMake.
 // =====================================================================
 
 plugins {
@@ -12,10 +15,16 @@ plugins {
 
 android {
     // "namespace" = the code package. Our Kotlin files use this name.
+    // The C++ function names (Java_com_haven_chat_...) depend on it too,
+    // so never change it.
     namespace = "com.haven.chat"
 
     // Android version we compile against (newest tools).
     compileSdk = 35
+
+    // PHASE 2: the NDK (C++ compiler for Android). The workflow installs
+    // exactly this version, so both places must say the same number.
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         // Unique app ID on the phone. Do not change after installing,
@@ -28,13 +37,51 @@ android {
         targetSdk = 35
 
         // Version shown to the user, and a counter that must go up.
-        versionCode = 1
+        versionCode = 2
         versionName = "0.2.0"
 
         // CPU ONLY, arm64-v8a ONLY (your Realme P3).
-        // This keeps the APK small and is needed later for llama.cpp.
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+
+        // PHASE 2: settings passed to CMake (the C++ build tool).
+        externalNativeBuild {
+            cmake {
+                // Release is essential: a Debug build of llama.cpp is very slow.
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                arguments += "-DANDROID_STL=c++_shared"
+
+                // llama.cpp: shared libraries, CPU only.
+                arguments += "-DBUILD_SHARED_LIBS=ON"
+                arguments += "-DLLAMA_BUILD_APP=OFF"
+                arguments += "-DLLAMA_BUILD_COMMON=ON"
+                arguments += "-DLLAMA_OPENSSL=OFF"
+
+                // ggml: build several CPU variants and pick the best one
+                // for the phone at run time.
+                arguments += "-DGGML_NATIVE=OFF"
+                arguments += "-DGGML_BACKEND_DL=ON"
+                arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
+                arguments += "-DGGML_LLAMAFILE=OFF"
+            }
+        }
+    }
+
+    // PHASE 2: where our CMakeLists.txt is, and which CMake version to use
+    // (the workflow installs the same version).
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.31.6"
+        }
+    }
+
+    // PHASE 2: the CPU variant libraries are loaded from the app's native
+    // library folder, so they must be extracted to disk on install.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 
@@ -58,8 +105,6 @@ android {
     buildFeatures {
         compose = true
     }
-
-    // PHASE 2 (later): the llama.cpp C++ build will be added here.
 }
 
 dependencies {
