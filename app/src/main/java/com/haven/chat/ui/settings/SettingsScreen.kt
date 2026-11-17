@@ -8,14 +8,28 @@
 //         button:   Load Model
 //         card:     System Prompt Editor (prompt, stop sequence, reset)
 // HOW IT WORKS: the screen edits a COPY of the settings ("draft").
-//   Nothing is applied until the user taps "Save & Reload", which hands
-//   the draft to the caller (onSaveAndReload). This matches your notes:
-//   changing context size or threads needs the model to reload.
+//   Nothing is applied until the user taps "Save & Reload" or
+//   "Load Model", which hand the draft to the caller. This matches your
+//   notes: changing context size or threads needs the model to reload.
+//
+// PHASE 2 CHANGES:
+//   - Browse now opens Android's file picker. The picked file is turned
+//     into a normal path (/storage/emulated/0/...) and put in the box.
+//   - The Load Model button shows the REAL engine status: "Loading
+//     model..." (with a small spinner), "Model loaded", or an error text.
+//   - Load Model now loads what is ON SCREEN (the draft), not the older
+//     saved settings. So onLoadModel receives the draft.
+//   - onBrowseClick is gone: the picker lives inside this file.
+//
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
-//   design. We add it later when the engine exists.
+//   design. We add it later.
 // =====================================================================
 package com.haven.chat.ui.settings
 
+import android.net.Uri
+import android.provider.DocumentsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,6 +43,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -36,6 +51,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -58,12 +74,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import com.haven.chat.engine.EngineManager
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------
 // DEFAULT VALUES. "const val" = a fixed value known at build time.
 // TODO: replace DEFAULT_SYSTEM_PROMPT with your real tested prompt from
-//       the old app when we reach Phase 2.
+//       the old app later.
 // ---------------------------------------------------------------------
 const val DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and briefly."
 const val DEFAULT_STOP_SEQUENCE = "<|endoftext|>"
@@ -85,6 +102,33 @@ data class AppSettings(
     val stopSequence: String = DEFAULT_STOP_SEQUENCE
 )
 
+// ---------------------------------------------------------------------
+// HELPER: turns the "address" that Android's file picker gives us into a
+// normal file path that the C++ engine can open.
+//
+// The picker returns something like
+//   content://com.android.externalstorage.documents/document/primary%3AHavenModels%2Fgemma.gguf
+// Its "document id" is   primary:HavenModels/gemma.gguf
+// "primary:" means the phone's internal storage = /storage/emulated/0/
+//
+// Returns null when we cannot make a normal path (SD card, cloud, ...).
+// ---------------------------------------------------------------------
+private fun pathFromPickedUri(uri: Uri): String? {
+    return try {
+        val id = DocumentsContract.getDocumentId(uri)
+        when {
+            // Internal storage: "primary:folder/file.gguf"
+            id.startsWith("primary:") -> "/storage/emulated/0/" + id.removePrefix("primary:")
+            // Some pickers hand over a ready path: "raw:/storage/..."
+            id.startsWith("raw:") -> id.removePrefix("raw:")
+            // SD card, Downloads app ids, cloud drives: no usable path.
+            else -> null
+        }
+    } catch (e: Exception) {
+        null   // not a document address
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -92,12 +136,39 @@ fun SettingsScreen(
     storageAllowed: Boolean,                 // is "All files access" granted?
     onBack: () -> Unit,                      // back arrow tapped
     onSaveAndReload: (AppSettings) -> Unit,  // "Save & Reload" tapped
-    onLoadModel: () -> Unit,                 // "Load Model" tapped
-    onBrowseClick: () -> Unit,               // "Browse" tapped (file picker later)
+    onLoadModel: (AppSettings) -> Unit,      // "Load Model" tapped (gets what is on screen)
     onStorageClick: () -> Unit               // storage badge tapped (permission)
 ) {
     // The draft: what the user is editing right now.
     var draft by remember { mutableStateOf(initial) }
+
+    // A short message under the Browse button (for example "not a .gguf file").
+    var browseMessage by remember { mutableStateOf("") }
+
+    // The file picker. "OpenDocument" shows Android's normal file chooser.
+    // When the user picks a file, the lambda below receives its address
+    // (or null if the user cancelled).
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val path = pathFromPickedUri(uri)
+            browseMessage = when {
+                path == null ->
+                    "Cannot use this location. Pick the file from internal storage (for example the HavenModels folder)."
+                !path.endsWith(".gguf", ignoreCase = true) ->
+                    "That is not a .gguf file."
+                else -> {
+                    draft = draft.copy(modelPath = path)   // put it in the box
+                    ""
+                }
+            }
+        }
+    }
+
+    // The REAL engine status. EngineManager.state is Compose state, so
+    // this screen redraws by itself when loading starts or ends.
+    val engineState = EngineManager.state
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -201,10 +272,19 @@ fun SettingsScreen(
                     label = { Text("Path to GGUF file") },
                     singleLine = true
                 )
-                OutlinedButton(onClick = onBrowseClick) {
+                // Browse: open the file picker ("*/*" = show all file types,
+                // because Android does not know the .gguf type).
+                OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }) {
                     Icon(Icons.Outlined.FolderOpen, contentDescription = null,
                         modifier = Modifier.size(18.dp))
                     Text("  Browse")
+                }
+                if (browseMessage.isNotEmpty()) {
+                    Text(
+                        text = browseMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
                 }
             }
 
@@ -240,13 +320,41 @@ fun SettingsScreen(
             }
 
             // ================= LOAD MODEL BUTTON =================
+            // The button text follows the real engine status.
+            // It is switched off while loading or while Gemma is answering.
             Button(
-                onClick = onLoadModel,
+                onClick = { onLoadModel(draft) },
+                enabled = engineState != EngineManager.State.LOADING &&
+                          engineState != EngineManager.State.THINKING,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp)
             ) {
-                Text("Load Model", style = MaterialTheme.typography.labelLarge)
+                // A small spinner while the model is being read into RAM.
+                if (engineState == EngineManager.State.LOADING) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(Modifier.width(10.dp))
+                }
+                Text(
+                    text = when (engineState) {
+                        EngineManager.State.LOADING -> "Loading model..."
+                        EngineManager.State.READY -> "Model loaded (tap to reload)"
+                        EngineManager.State.THINKING -> "Gemma is answering..."
+                        else -> "Load Model"
+                    },
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+            // If loading failed, show the plain-words reason right here.
+            if (engineState == EngineManager.State.ERROR && EngineManager.errorMessage.isNotEmpty()) {
+                Text(
+                    text = EngineManager.errorMessage,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
             }
 
             // ================= SYSTEM PROMPT EDITOR =================

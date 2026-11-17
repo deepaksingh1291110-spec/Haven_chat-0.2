@@ -4,10 +4,19 @@
 //         - two pages with navigation: "chat" and "settings"
 //         - the side drawer, which slides over the chat page
 //         - the two ViewModels (chat data, settings data)
-// WHO CALLS IT: MainActivity (next file) calls HavenApp() once.
+// WHO CALLS IT: MainActivity calls HavenApp() once.
 // STORAGE PERMISSION: Only an Activity can check or ask for "All files
 //   access". So MainActivity does that and hands us two things:
 //   storageAllowed (true/false) and onRequestStorageAccess (a function).
+//
+// PHASE 2 CHANGES:
+//   - Tapping the status chip in the chat loads the model when it is
+//     "Not loaded" or "Error" (with the saved settings).
+//   - The "Load Model" button in Settings now hands over the settings
+//     that are on screen: they are saved and the model is loaded. We
+//     stay on the Settings page so the button text can be watched.
+//   - The Browse file picker now lives inside SettingsScreen, so the
+//     onBrowseClick line is gone.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -25,6 +34,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.haven.chat.data.DummyData
+import com.haven.chat.engine.EngineManager
 import com.haven.chat.ui.chat.ChatScreen
 import com.haven.chat.ui.chat.ChatViewModel
 import com.haven.chat.ui.drawer.DrawerContent
@@ -99,7 +109,16 @@ fun HavenApp(
                     onMenuClick = { scope.launch { drawerState.open() } },
                     onNewChatClick = { chatViewModel.startNewChat() },
                     // The tune icon in the input bar opens Settings for now.
-                    onOptionsClick = { navController.navigate(ROUTE_SETTINGS) }
+                    onOptionsClick = { navController.navigate(ROUTE_SETTINGS) },
+                    // Tap on the status chip: load the model, but ONLY when
+                    // it is not loaded (or the last load failed). In the
+                    // states Loading, Ready and Thinking a tap does nothing.
+                    onStatusClick = {
+                        val s = EngineManager.state
+                        if (s == EngineManager.State.NOT_LOADED || s == EngineManager.State.ERROR) {
+                            settingsViewModel.loadModel()
+                        }
+                    }
                 )
             }
         }
@@ -114,8 +133,10 @@ fun HavenApp(
                     settingsViewModel.saveSettings(newSettings)
                     navController.popBackStack()   // go back to the chat after saving
                 },
-                onLoadModel = { settingsViewModel.loadModel() },
-                onBrowseClick = { /* TODO later: open a file picker */ },
+                // "Load Model": save what is on screen, then load it.
+                // (saveSettings stores the settings AND loads the model.)
+                // We stay on this page so the button can show "Loading...".
+                onLoadModel = { draft -> settingsViewModel.saveSettings(draft) },
                 onStorageClick = onRequestStorageAccess
             )
         }

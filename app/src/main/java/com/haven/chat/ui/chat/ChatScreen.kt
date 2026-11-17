@@ -2,17 +2,24 @@
 // ChatScreen.kt  (app/src/main/java/com/haven/chat/ui/chat/)
 // WHAT: The full chat screen from your design:
 //         top bar:  [menu]   Haven Chat   [new chat]
-//         chip:     gemma4-e2b • Ready
+//         chip:     gemma4-e2b • Ready   (tap it to load the model)
 //         list:     message bubbles (scrolls)
 //         bottom:   message input bar
 // DESIGN RULE: this screen is "stateless". It does NOT own any data.
 //   It only DRAWS the list it is given and REPORTS taps upward
-//   (onSend, onMenuClick, ...). A ViewModel (next file) owns the data.
-//   This makes it easy to plug the real AI engine in during Phase 2.
+//   (onSend, onMenuClick, ...). A ViewModel owns the data.
+//
+// PHASE 2 CHANGES:
+//   - The status chip can be tapped (onStatusClick). The caller decides
+//     what a tap does (HavenApp loads the model when it is not loaded).
+//   - The list now also scrolls DOWN while an answer is being streamed,
+//     not only when a new message is added.
 // =====================================================================
 package com.haven.chat.ui.chat
 
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -40,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import com.haven.chat.data.ChatMessage
 import com.haven.chat.ui.theme.StatusGreen
@@ -54,16 +62,26 @@ fun ChatScreen(
     onSend: (String) -> Unit,           // user sent a message
     onMenuClick: () -> Unit,            // user tapped the menu icon (open drawer)
     onNewChatClick: () -> Unit,         // user tapped the pencil icon
-    onOptionsClick: () -> Unit          // user tapped the tune icon in the input bar
+    onOptionsClick: () -> Unit,         // user tapped the tune icon in the input bar
+    onStatusClick: () -> Unit = {}      // user tapped the status chip (default: do nothing)
 ) {
     // Remembers the scroll position of the message list.
     val listState = rememberLazyListState()
 
-    // LaunchedEffect runs its block again whenever the key changes.
-    // Key = number of messages. So when a message is added, scroll down to it.
-    LaunchedEffect(messages.size) {
+    // LaunchedEffect runs its block again whenever ANY of its keys change:
+    //   - the number of messages (a message was added), or
+    //   - the length of the last message's text or thinking (it is
+    //     growing because Gemma is streaming the answer).
+    // Then we scroll to the very end so the newest text stays visible.
+    val last = messages.lastOrNull()
+    LaunchedEffect(messages.size, last?.text?.length, last?.thinking?.length) {
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
+            // First jump to the last message ...
+            listState.scrollToItem(messages.lastIndex)
+            // ... then push to the very bottom of it (a long answer is
+            // taller than the screen). Scrolling "too far" is harmless:
+            // the list simply stops at its end.
+            listState.scrollBy(100000f)
         }
     }
 
@@ -120,6 +138,8 @@ fun ChatScreen(
                 .padding(innerPadding)
         ) {
             // ---------- STATUS CHIP ----------
+            // Tapping it calls onStatusClick (HavenApp loads the model
+            // when it is "Not loaded" or "Error").
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -131,6 +151,9 @@ fun ChatScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = StatusGreen,
                     modifier = Modifier
+                        // clip first, so the tap ripple has rounded corners
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onStatusClick)
                         .border(
                             width = 1.dp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
