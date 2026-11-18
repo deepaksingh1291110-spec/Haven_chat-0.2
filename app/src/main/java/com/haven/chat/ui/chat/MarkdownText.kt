@@ -46,6 +46,19 @@
  *    use soft shades that look good on a dark theme. Hex works too: #FF69B4.
  *  - Images and footnotes are NOT supported: they stay plain text.
  *
+ *  MATH (LaTeX) SUPPORT (added after Phase 3)
+ *  ------------------------------------------
+ *  Gemma writes math in LaTeX: $x^2$, $$\frac{a}{b}$$, \(..\), \[..\].
+ *  Two hooks turn it into readable text; the converter itself is in
+ *  MathText.kt (latexToAnnotated, findInlineMath, detectMathBlock):
+ *    - BLOCK parser:  a formula that fills whole lines ($$ ... $$ or
+ *      \[ ... \]) becomes Block.Math and is drawn centered by MathBlockView.
+ *    - INLINE parser: a formula inside a sentence is converted in place by
+ *      handleDollar (for $ and $$) and handleBackslash (for \( and \[).
+ *  Prices like "$5 and $10" stay normal text. A formula whose closing sign
+ *  has not arrived yet (streaming) stays plain text until it arrives.
+ *  "\$" shows a normal dollar sign.
+ *
  *  COPY BUTTON ON CODE BLOCKS (added after Phase 3)
  *  ------------------------------------------------
  *  Every code block has a small "Copy" button in its top row (next to the
@@ -241,6 +254,8 @@ private sealed interface Block {
     data class Code(val language: String, val code: String) : Block
     object Rule : Block
     data class Quote(val text: String) : Block
+    /** MATH: a display formula on its own lines ($$ ... $$ or \[ ... \]). Raw LaTeX. */
+    data class Math(val latex: String) : Block
     /**
      * A table. aligns has one entry per column: 0 = left, 1 = center, 2 = right.
      * Every row has exactly header.size cells (padded or cut by the parser).
@@ -324,6 +339,20 @@ private fun parseBlocksUnsafe(raw: String): List<Block> {
             }
             i++ // skip the closing fence line (or step past the end)
             blocks.add(Block.Code(fence.language, codeLines.joinToString("\n").trimEnd('\n')))
+            continue
+        }
+
+        // ---- MATH: a display formula that fills whole lines:
+        //      $$ ... $$   or   \[ ... \]   (one line or several lines).
+        //      If the closing sign has not arrived yet (streaming), or text
+        //      follows it on the same line, this returns null and the text
+        //      is handled as a normal paragraph (inline math still works there).
+        val mathBlock = detectMathBlock(lines, i)
+        if (mathBlock != null) {
+            flushParagraph()
+            canContinueItem = false
+            blocks.add(Block.Math(mathBlock.latex))
+            i = mathBlock.nextIndex
             continue
         }
 
@@ -617,7 +646,7 @@ private const val MAX_URL_LENGTH = 2000     // longest link URL we try to match
 private const val MAX_TAG_LENGTH = 200      // longest HTML tag like <span style="...">
 
 // Characters that a backslash can escape:  \*  \_  \`  \\  \#  \[  ...
-private const val ESCAPABLE = "\\`*_{}[]()#+-.!~|><"
+private const val ESCAPABLE = "\\`*_{}[]()#+-.!~|><\$"   // MATH: "\$" shows a normal $
 
 /**
  * Turns one block's text into an AnnotatedString. Never throws:
@@ -688,6 +717,7 @@ private class InlineParser(
             val c = src[i]
             val next = when (c) {
                 '\\' -> handleBackslash(i, to)
+                '$' -> handleDollar(i, to)
                 '`' -> handleCode(i, to)
                 '*', '_' -> handleEmphasis(i, to, depth)
                 '~' -> handleStrike(i, to, depth)
@@ -706,12 +736,42 @@ private class InlineParser(
     // ---- backslash escape ---------------------------------------------------
 
     private fun handleBackslash(i: Int, to: Int): Int {
+        // MATH: "\( ... \)" and "\[ ... \]" are formulas. Only when the closing
+        // sign exists; otherwise the normal escape rule below is used.
+        if (i + 1 < to && (src[i + 1] == '(' || src[i + 1] == '[')) {
+            val span = findInlineMath(src, i, to)
+            if (span != null) {
+                out.append(latexToAnnotated(span.latex))
+                return span.end
+            }
+        }
         if (i + 1 < to && ESCAPABLE.indexOf(src[i + 1]) >= 0) {
             out.append(src[i + 1]) // show the escaped character literally
             return i + 2
         }
         out.append('\\') // a normal backslash stays
         return i + 1
+    }
+
+    // ---- MATH: $formula$ and $$formula$$ inside a sentence --------------------
+
+    /**
+     * A "$" starts a formula only when a matching closing sign exists and
+     * the text looks like math (see findInlineMath in MathText.kt: prices such
+     * as "$5 and $10" are NOT formulas). The formula is converted to styled
+     * text (symbols, small raised/lowered parts...) and written in place.
+     * If it is not a formula, the dollar sign(s) stay as normal text.
+     */
+    private fun handleDollar(i: Int, to: Int): Int {
+        val span = findInlineMath(src, i, to)
+        if (span != null) {
+            out.append(latexToAnnotated(span.latex))
+            return span.end
+        }
+        // Not a formula: write the whole run of $ signs as plain text.
+        val run = runLength('$', i, to)
+        out.append(src.substring(i, i + run))
+        return i + run
     }
 
     // ---- `inline code` --------------------------------------------------------
@@ -1181,8 +1241,38 @@ private fun BlockView(block: Block, look: Look) {
         Block.Rule -> RuleView(look)
         is Block.Quote -> QuoteView(block.text, look)
         is Block.Table -> TableView(block, look)
+        is Block.Math -> MathBlockView(block.latex, look)
         // List items are drawn by ListGroup (see MarkdownText).
         is Block.Bullet, is Block.Numbered -> Unit
+    }
+}
+
+/**
+ * MATH: a display formula on its own. Centered. If it is wider than the
+ * screen it scrolls sideways (like code blocks) instead of wrapping.
+ * The LaTeX is converted by latexToAnnotated (MathText.kt); the conversion
+ * is cached per text.
+ */
+@Composable
+private fun MathBlockView(latex: String, look: Look) {
+    val annotated = remember(latex) { latexToAnnotated(latex) }
+    // Outer Box centers the formula. The Text inside scrolls sideways: when it
+    // is narrow it takes only its own width (so it stays centered), when it is
+    // wider than the box it fills the box and scrolls.
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = annotated,
+            style = look.body,
+            color = look.color,
+            textAlign = TextAlign.Center,
+            softWrap = false,
+            modifier = Modifier.horizontalScroll(rememberScrollState())
+        )
     }
 }
 
