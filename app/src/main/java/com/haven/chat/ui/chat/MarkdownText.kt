@@ -46,6 +46,16 @@
  *    use soft shades that look good on a dark theme. Hex works too: #FF69B4.
  *  - Images and footnotes are NOT supported: they stay plain text.
  *
+ *  COPY BUTTON ON CODE BLOCKS (added after Phase 3)
+ *  ------------------------------------------------
+ *  Every code block has a small "Copy" button in its top row (next to the
+ *  language name). One tap puts ONLY the code on the clipboard and the
+ *  button says "Copied" for 1.5 seconds. The top row is wrapped in
+ *  DisableSelection, so when the user selects text by long-press, the
+ *  words "python" and "Copy" are never part of the selection.
+ *  (Text selection itself is switched on in MessageBubble.kt with a
+ *  SelectionContainer around MarkdownText.)
+ *
  *  SAFETY RULES
  *  ------------
  *  - Parsing is wrapped in try/catch. Worst case = plain text, never a crash.
@@ -61,6 +71,7 @@ package com.haven.chat.ui.chat
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -75,15 +86,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -96,6 +114,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
+import kotlinx.coroutines.delay
 
 // ============================================================================
 //  1. PUBLIC API  (the only public thing in this file)
@@ -1229,6 +1248,17 @@ private fun ListRow(
 /** Fenced code block: monospace, rounded, scrolls sideways, shows the language on top. */
 @Composable
 private fun CodeView(language: String, code: String, look: Look) {
+    // COPY: the phone's clipboard, and a flag that is true for 1.5 seconds
+    // after a tap (the button then says "Copied").
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1500)
+            copied = false
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1236,10 +1266,31 @@ private fun CodeView(language: String, code: String, look: Look) {
             .background(look.codeBackground)
             .padding(12.dp)
     ) {
-        if (language.isNotEmpty()) {
-            Text(text = language, style = look.labelStyle, color = look.codeLabel)
-            Spacer(modifier = Modifier.height(4.dp))
+        // COPY: top row = language name on the left, "Copy" button on the
+        // right. DisableSelection keeps these two words OUT of a text
+        // selection, so when the user selects code, only the code is copied.
+        DisableSelection {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = language, style = look.labelStyle, color = look.codeLabel)
+                Text(
+                    text = if (copied) "Copied" else "Copy",
+                    style = look.labelStyle,
+                    color = look.codeLabel,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable {
+                            clipboard.setText(AnnotatedString(code))   // ONLY the code
+                            copied = true
+                        }
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                )
+            }
         }
+        Spacer(modifier = Modifier.height(4.dp))
         // softWrap = false + horizontalScroll: long lines do NOT wrap, you scroll instead.
         Text(
             text = code,
