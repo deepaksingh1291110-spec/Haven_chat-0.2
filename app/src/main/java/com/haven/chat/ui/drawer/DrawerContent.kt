@@ -27,7 +27,10 @@
 //   - Texts for an empty list: "No chats yet" and "No chats found".
 //   - A small hint is shown while Gemma is busy (switching or deleting
 //     chats waits until it is done).
-//   - Hardware card is unchanged (it becomes real in a later step).
+//   - HARDWARE CARD IS NOW REAL (step 8): it shows the chip name, the CPU
+//     features that speed up Gemma (NEON, DOTPROD, I8MM...) and how many
+//     of the phone's cores are used. The facts come from HardwareInfo.kt.
+//     No new parameters are needed: the card reads them once by itself.
 // =====================================================================
 package com.haven.chat.ui.drawer
 
@@ -85,9 +88,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.haven.chat.data.ChatSummary
+import com.haven.chat.engine.HardwareInfo
 import com.haven.chat.ui.theme.DarkDrawerBackground
 
 // PHASE 3: one height for the "New chat" button AND the search box.
@@ -471,9 +476,19 @@ private fun RenameDialog(
     )
 }
 
+// ---------------------------------------------------------------------
 // The rounded card with 3 lines of hardware info.
+// PHASE 3 (step 8): the values are REAL now.
+//   CPU             the chip name of this phone
+//   Instruction Set the CPU features that make Gemma faster
+//   Threading       "threads in use of cores available", e.g. "4 of 8 cores"
+// ---------------------------------------------------------------------
 @Composable
 private fun HardwareCard(threads: Int) {
+    // Read the phone's facts ONCE and keep them while the drawer exists.
+    // (HardwareInfo.read() takes a few milliseconds and never throws.)
+    val hardware = remember { HardwareInfo.read() }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -482,16 +497,18 @@ private fun HardwareCard(threads: Int) {
             .padding(horizontal = 20.dp, vertical = 16.dp)
     ) {
         Text("Hardware Status", style = MaterialTheme.typography.titleMedium)
-        // NEON and INT8 are fixed text for now (your phone's CPU features).
-        HardwareLine("CPU", "NEON")
+        HardwareLine("CPU", hardware.cpuName)
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-        HardwareLine("Instruction Set", "INT8")
+        HardwareLine("Instruction Set", hardware.features)
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-        HardwareLine("Threading", "$threads Threads")
+        HardwareLine("Threading", "$threads of ${hardware.cores} cores")
     }
 }
 
 // One "label ........ value" line inside the hardware card.
+// PHASE 3: the value may be long (for example "NEON, DOTPROD, I8MM, BF16"),
+// so it takes only the room that is left and is right-aligned. If it is
+// still too long it moves to a second line instead of pushing the label.
 @Composable
 private fun HardwareLine(label: String, value: String) {
     Row(
@@ -502,7 +519,14 @@ private fun HardwareLine(label: String, value: String) {
     ) {
         Text(label, style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.End,
+            modifier = Modifier
+                .weight(1f, fill = false)      // use only the space that is left
+                .padding(start = 16.dp)
+        )
     }
 }
 
