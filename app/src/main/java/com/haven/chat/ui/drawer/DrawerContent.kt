@@ -1,16 +1,33 @@
 // =====================================================================
 // DrawerContent.kt  (app/src/main/java/com/haven/chat/ui/drawer/)
 // WHAT: The content of the side menu (drawer) from your design:
-//         [New chat] [Search chats........] [X]
+//         [New chat] [Search........]  [X]
 //         Today
-//           . Local NPU acceleration check        ...
+//           . Chat title                          ...
 //         Hardware Status card (CPU, Instruction Set, Threading)
 //         Preferences: Settings, Model management, Privacy, Storage, About
 // HOW:  It draws only the INSIDE of the menu. The sliding animation and
-//       the dark overlay come from ModalNavigationDrawer (a later file).
+//       the dark overlay come from ModalNavigationDrawer (in HavenApp).
 // STATELESS: it gets data in, and reports taps out (callbacks).
-// STATUS: Only "New chat", chat rows, close and Settings do something.
-//         The other preference rows are visual only for now.
+//
+// PHASE 3 CHANGES (marked "PHASE 3"):
+//   - The chat list is now REAL (from the database, through ChatViewModel).
+//   - Search: the text is handed UP (onQueryChange). The database does the
+//     searching (titles AND message texts), so the list we get is already
+//     filtered. The old filter inside this file is gone.
+//   - Tapping a chat opens it (onChatClick). The open chat is highlighted.
+//   - The "..." on every chat is now a real menu: Rename and Delete.
+//       Rename -> small dialog with a text box.
+//       Delete -> asks "Are you sure?" first (it cannot be undone).
+//     Delete is switched off while Gemma is busy.
+//   - UI FIX: the search box is now exactly as tall as the "New chat"
+//     button (48 dp, same rounded shape). Material's TextField has a fixed
+//     minimum height of 56 dp that cannot be made smaller, so the search
+//     box is built by hand with BasicTextField.
+//   - Texts for an empty list: "No chats yet" and "No chats found".
+//   - A small hint is shown while Gemma is busy (switching or deleting
+//     chats waits until it is done).
+//   - Hardware card is unchanged (it becomes real in a later step).
 // =====================================================================
 package com.haven.chat.ui.drawer
 
@@ -28,13 +45,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Memory
@@ -42,15 +62,18 @@ import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,27 +83,43 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.haven.chat.data.ChatSummary
 import com.haven.chat.ui.theme.DarkDrawerBackground
 
+// PHASE 3: one height for the "New chat" button AND the search box.
+private val TopRowHeight = 48.dp
+
+// PHASE 3: longest title the rename box accepts (the repository cuts at the
+// same length).
+private const val MAX_RENAME_CHARS = 60
+
 @Composable
 fun DrawerContent(
-    chats: List<ChatSummary>,            // chat history to list
+    chats: List<ChatSummary>,            // chats to list (already filtered by the search)
+    currentChatId: Long?,                // PHASE 3: the open chat (highlighted), or null
+    query: String,                       // PHASE 3: text in the search box
+    onQueryChange: (String) -> Unit,     // PHASE 3: the user typed in the search box
+    engineBusy: Boolean,                 // PHASE 3: Gemma is loading / answering / naming
     threads: Int,                        // CPU threads shown in Hardware Status
     onNewChatClick: () -> Unit,
     onChatClick: (Long) -> Unit,         // gives the id of the tapped chat
+    onRenameChat: (Long, String) -> Unit, // PHASE 3: chat id and the new title
+    onDeleteChat: (Long) -> Unit,        // PHASE 3: chat id (after the user confirmed)
     onSettingsClick: () -> Unit,
     onCloseClick: () -> Unit
 ) {
-    // Text typed in the search box. Starts empty.
-    var query by remember { mutableStateOf("") }
-
-    // Filter: keep chats whose title contains the query (ignore capitals).
-    val filtered = chats.filter { it.title.contains(query, ignoreCase = true) }
     // Group by section name ("Today", "Yesterday"...). Result: Map<name, list>.
-    val grouped = filtered.groupBy { it.group }
+    // The list is sorted newest first, so the sections come in the right order.
+    val grouped = chats.groupBy { it.group }
+
+    // PHASE 3: which chat is being renamed / deleted right now (null = none).
+    // These decide whether a dialog is shown.
+    var renameTarget by remember { mutableStateOf<ChatSummary?>(null) }
+    var deleteTarget by remember { mutableStateOf<ChatSummary?>(null) }
 
     // Your design uses pure black in dark mode; light mode uses the theme color.
     val drawerColor =
@@ -104,8 +143,10 @@ fun DrawerContent(
                     .padding(top = 12.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // The button gets the shared height.
                 Button(
                     onClick = onNewChatClick,
+                    modifier = Modifier.height(TopRowHeight),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFF2F2F2),
                         contentColor = Color(0xFF1C1B1F)
@@ -115,22 +156,15 @@ fun DrawerContent(
                     Text(text = " New chat", style = MaterialTheme.typography.labelLarge)
                 }
 
-                TextField(
-                    value = query,
-                    onValueChange = { query = it },
+                // PHASE 3: the search box, built by hand so it can be exactly
+                // as tall as the button (see the notes at the top).
+                SearchBox(
+                    query = query,
+                    onQueryChange = onQueryChange,
                     modifier = Modifier
                         .weight(1f)                    // take the free width
-                        .padding(horizontal = 8.dp),
-                    placeholder = { Text("Search chats") },
-                    leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                    singleLine = true,
-                    shape = RoundedCornerShape(24.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surface,
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                        focusedIndicatorColor = Color.Transparent,   // hide underline
-                        unfocusedIndicatorColor = Color.Transparent
-                    )
+                        .padding(horizontal = 8.dp)
+                        .height(TopRowHeight)
                 )
 
                 IconButton(onClick = onCloseClick) {
@@ -138,6 +172,28 @@ fun DrawerContent(
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+            // PHASE 3: hint while the engine is busy.
+            if (engineBusy) {
+                Text(
+                    text = "Gemma is busy. Opening, switching and deleting chats works again when it is done.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 12.dp)
+                )
+            }
+        }
+
+        // ---------- PHASE 3: EMPTY LIST TEXT ----------
+        if (chats.isEmpty()) {
+            item {
+                Text(
+                    text = if (query.isBlank()) "No chats yet" else "No chats found",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 24.dp)
+                )
+            }
         }
 
         // ---------- CHAT HISTORY, grouped by section ----------
@@ -152,7 +208,14 @@ fun DrawerContent(
             }
             // One row per chat in the section.
             items(groupChats, key = { it.id }) { chat ->
-                ChatRow(chat = chat, onClick = { onChatClick(chat.id) })
+                ChatRow(
+                    chat = chat,
+                    selected = chat.id == currentChatId,
+                    engineBusy = engineBusy,
+                    onClick = { onChatClick(chat.id) },
+                    onRenameClick = { renameTarget = chat },
+                    onDeleteClick = { deleteTarget = chat }
+                )
             }
         }
 
@@ -177,16 +240,133 @@ fun DrawerContent(
             Spacer(Modifier.height(24.dp))
         }
     }
+
+    // ---------- PHASE 3: DIALOGS ----------
+    // A dialog opens in its own window, so it is fine to write it here,
+    // after the list. It shows only while its "target" is not null.
+
+    // RENAME dialog
+    renameTarget?.let { chat ->
+        RenameDialog(
+            oldTitle = chat.title,
+            onConfirm = { newTitle ->
+                onRenameChat(chat.id, newTitle)
+                renameTarget = null
+            },
+            onDismiss = { renameTarget = null }
+        )
+    }
+
+    // DELETE confirmation dialog
+    deleteTarget?.let { chat ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete this chat?") },
+            text = {
+                Text(
+                    "\"${chat.title}\" and all its messages will be deleted from " +
+                            "this phone. This cannot be undone."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteChat(chat.id)
+                        deleteTarget = null
+                    }
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+            }
+        )
+    }
 }
 
-// ONE chat row: small colored dot, title, "..." button.
+// ---------------------------------------------------------------------
+// PHASE 3: the search box. Looks like before (rounded, dark, magnifier
+// icon) but its height is whatever the caller gives it (48 dp).
+// BasicTextField = a plain text input with NO built-in look; we draw the
+// look ourselves in "decorationBox".
+// ---------------------------------------------------------------------
 @Composable
-private fun ChatRow(chat: ChatSummary, onClick: () -> Unit) {
+private fun SearchBox(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    BasicTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = modifier,
+        singleLine = true,
+        textStyle = MaterialTheme.typography.bodyMedium.copy(
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        // The blinking cursor gets the theme's main color.
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        decorationBox = { innerTextField ->
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Search,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier.weight(1f),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    // The hint text: one line only, so it never wraps.
+                    if (query.isEmpty()) {
+                        Text(
+                            text = "Search",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    innerTextField()   // the real typed text goes here
+                }
+            }
+        }
+    )
+}
+
+// ---------------------------------------------------------------------
+// ONE chat row: small colored dot, title, "..." menu (Rename, Delete).
+// ---------------------------------------------------------------------
+@Composable
+private fun ChatRow(
+    chat: ChatSummary,
+    selected: Boolean,            // PHASE 3: this is the open chat
+    engineBusy: Boolean,          // PHASE 3: Delete is switched off while busy
+    onClick: () -> Unit,
+    onRenameClick: () -> Unit,
+    onDeleteClick: () -> Unit
+) {
+    // Is the small "..." menu open? (Each row remembers its own.)
+    var menuOpen by remember { mutableStateOf(false) }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            // The open chat gets a soft background.
+            .background(if (selected) MaterialTheme.colorScheme.surface else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(vertical = 10.dp),
+            .padding(start = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // The dot: a small circle.
@@ -199,17 +379,96 @@ private fun ChatRow(chat: ChatSummary, onClick: () -> Unit) {
         Text(
             text = chat.title,
             style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,                                  // long titles get "..."
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 14.dp)
+                .padding(horizontal = 14.dp, vertical = 10.dp)
         )
-        // "..." menu (rename/delete will come later).
-        Icon(
-            imageVector = Icons.Filled.MoreHoriz,
-            contentDescription = "Chat options",
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+
+        // "..." button with its menu. The Box is the anchor the menu opens at.
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(
+                    imageVector = Icons.Filled.MoreHoriz,
+                    contentDescription = "Chat options",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false }
+            ) {
+                DropdownMenuItem(
+                    text = { Text("Rename") },
+                    leadingIcon = { Icon(Icons.Outlined.Edit, contentDescription = null) },
+                    onClick = {
+                        menuOpen = false
+                        onRenameClick()
+                    }
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = "Delete",
+                            color = if (engineBusy) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.error
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            Icons.Outlined.Delete,
+                            contentDescription = null,
+                            tint = if (engineBusy) MaterialTheme.colorScheme.onSurfaceVariant
+                                   else MaterialTheme.colorScheme.error
+                        )
+                    },
+                    enabled = !engineBusy,                 // not while Gemma is busy
+                    onClick = {
+                        menuOpen = false
+                        onDeleteClick()
+                    }
+                )
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------
+// PHASE 3: the rename dialog: a text box with the old title, [Cancel] [Save].
+// ---------------------------------------------------------------------
+@Composable
+private fun RenameDialog(
+    oldTitle: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    // The text being edited. It starts with the old title.
+    var text by remember { mutableStateOf(oldTitle) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename chat") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { if (it.length <= MAX_RENAME_CHARS) text = it },
+                singleLine = true,
+                supportingText = { Text("${text.length} / $MAX_RENAME_CHARS") }
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(text) },
+                enabled = text.isNotBlank()                // an empty title is not allowed
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 // The rounded card with 3 lines of hardware info.

@@ -16,17 +16,35 @@
 //     not only when a new message is added.
 //   - Stop button: isGenerating and onStop are passed on to the input bar,
 //     where the send button turns into a stop button while Gemma works.
+//
+// PHASE 3 CHANGES (marked "PHASE 3"):
+//   1) GEMINI-STYLE FADE (your UI fix). Before, the top bar and the chip
+//      were solid and the list started BELOW them, so messages were cut
+//      off with a hard edge. Now:
+//        - the top bar is transparent,
+//        - the message list fills the whole screen and scrolls BEHIND the
+//          top bar and the chip,
+//        - a soft gradient (background color -> transparent) lies over
+//          that area, so text fades out gently as it nears the top.
+//      When you are at the top of a chat, the first message still starts
+//      below the chip (the list has extra space on top for that).
+//      The strength of the fade is set by the constants just below.
+//   2) WAIT / CANCEL POPUP. While Gemma writes a chat title (Auto-name
+//      chats), a message sent by the user is held back and this popup is
+//      shown:  [Cancel]  [Wait].  The ViewModel decides what they do.
+//      Closing the popup by tapping outside counts as "Wait".
 // =====================================================================
 package com.haven.chat.ui.chat
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -37,6 +55,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -44,15 +63,35 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.haven.chat.data.ChatMessage
 import com.haven.chat.ui.theme.StatusGreen
+
+// ---------------------------------------------------------------------
+// PHASE 3: numbers for the fade. Change them to taste.
+// ---------------------------------------------------------------------
+
+// Height of the status-chip area: chip (36 dp) + 8 dp above and below.
+private val ChipAreaHeight = 52.dp
+
+// How far the fade reaches BELOW the chip area. Bigger = softer, longer fade.
+private val FadeExtraHeight = 32.dp
+
+// How strong the cover is at the very top (1.0 = fully solid, 0.0 = none).
+// A little below 1.0 lets faint text show through under the top bar, like Gemini.
+private const val FadeAlphaTop = 0.96f
+
+// How strong it is at the middle of the gradient.
+private const val FadeAlphaMiddle = 0.85f
 
 // CenterAlignedTopAppBar is still marked "experimental" by Google, but it
 // is stable enough to use. @OptIn tells the compiler "I accept that".
@@ -67,7 +106,10 @@ fun ChatScreen(
     onOptionsClick: () -> Unit,         // user tapped the tune icon in the input bar
     onStatusClick: () -> Unit = {},     // user tapped the status chip (default: do nothing)
     isGenerating: Boolean = false,      // true while Gemma is busy (the send button becomes "stop")
-    onStop: () -> Unit = {}             // user tapped the stop button
+    onStop: () -> Unit = {},            // user tapped the stop button
+    namingDialogVisible: Boolean = false, // PHASE 3: show the Wait / Cancel popup
+    onWaitNaming: () -> Unit = {},        // PHASE 3: user chose "Wait" (or closed the popup)
+    onCancelNaming: () -> Unit = {}       // PHASE 3: user chose "Cancel"
 ) {
     // Remembers the scroll position of the message list.
     val listState = rememberLazyListState()
@@ -89,11 +131,16 @@ fun ChatScreen(
         }
     }
 
+    // The color the fade blends into: the screen background.
+    val background = MaterialTheme.colorScheme.background
+
     // Scaffold = standard screen layout: top bar, content, bottom bar.
     Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = background,
 
         // ---------- TOP BAR ----------
+        // PHASE 3: the container is TRANSPARENT now, so the messages (and
+        // the fade) can be seen behind the title and the icons.
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
@@ -113,7 +160,8 @@ fun ChatScreen(
                     }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
+                    containerColor = Color.Transparent,
+                    scrolledContainerColor = Color.Transparent,
                     titleContentColor = MaterialTheme.colorScheme.onBackground,
                     navigationIconContentColor = MaterialTheme.colorScheme.onBackground,
                     actionIconContentColor = MaterialTheme.colorScheme.onBackground
@@ -138,18 +186,68 @@ fun ChatScreen(
         }
     ) { innerPadding ->
         // innerPadding = space taken by the top bar and bottom bar.
-        // We must apply it, or content hides behind them.
-        Column(
+        // PHASE 3: we use only the BOTTOM part as normal padding (so the
+        // list ends above the input bar). The TOP part is used below, as
+        // space INSIDE the list, so messages can slide up behind the bar.
+        val topBarSpace = innerPadding.calculateTopPadding()
+
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
+                .padding(bottom = innerPadding.calculateBottomPadding())
         ) {
+            // ---------- MESSAGE LIST ----------
+            // LazyColumn only draws the messages visible on screen,
+            // so long chats stay fast and use little RAM.
+            // PHASE 3: it fills the WHOLE box (also behind the top bar). The
+            // top contentPadding keeps the first message clear of the bar
+            // and the chip when the chat is scrolled to the top.
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    top = topBarSpace + ChipAreaHeight + 8.dp,
+                    bottom = 8.dp
+                )
+            ) {
+                // "key" gives each message a stable identity (its id),
+                // so Compose does not redraw everything when one is added.
+                items(messages, key = { it.id }) { message ->
+                    MessageBubble(message)
+                }
+            }
+
+            // ---------- PHASE 3: THE FADE ----------
+            // A gradient that starts almost solid at the very top and ends
+            // fully transparent. It lies over the list, under the title and
+            // the chip. It does not catch touches: the list can still be
+            // scrolled through it.
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .fillMaxWidth()
+                    .height(topBarSpace + ChipAreaHeight + FadeExtraHeight)
+                    .background(
+                        Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0f to background.copy(alpha = FadeAlphaTop),
+                                0.55f to background.copy(alpha = FadeAlphaMiddle),
+                                1f to Color.Transparent
+                            )
+                        )
+                    )
+            )
+
             // ---------- STATUS CHIP ----------
             // Tapping it calls onStatusClick (HavenApp loads the model
             // when it is "Not loaded" or "Error").
+            // PHASE 3: it now sits on top of the list (drawn after it),
+            // just below the top bar.
             Box(
                 modifier = Modifier
+                    .align(Alignment.TopCenter)
                     .fillMaxWidth()
+                    .padding(top = topBarSpace)
                     .padding(vertical = 8.dp),
                 contentAlignment = Alignment.Center
             ) {
@@ -169,21 +267,32 @@ fun ChatScreen(
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
-
-            // ---------- MESSAGE LIST ----------
-            // LazyColumn only draws the messages visible on screen,
-            // so long chats stay fast and use little RAM.
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f),     // take all remaining height
-                contentPadding = PaddingValues(vertical = 8.dp)
-            ) {
-                // "key" gives each message a stable identity (its id),
-                // so Compose does not redraw everything when one is added.
-                items(messages, key = { it.id }) { message ->
-                    MessageBubble(message)
-                }
-            }
         }
+    }
+
+    // ---------- PHASE 3: WAIT / CANCEL POPUP ----------
+    // Shown while Gemma is writing a chat title and the user has sent a
+    // message in the meantime. The message is held back by the ViewModel.
+    //   Wait   -> the message is sent when the title is ready (a few seconds).
+    //   Cancel -> the naming stops, the chat keeps its quick title, and the
+    //             message is sent right away.
+    // Tapping outside the popup (or Back) counts as "Wait".
+    if (namingDialogVisible) {
+        AlertDialog(
+            onDismissRequest = onWaitNaming,
+            title = { Text("Gemma is naming this chat") },
+            text = {
+                Text(
+                    "Your message is ready to send. Wait a few seconds for the " +
+                            "title, or cancel the naming and send it now."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onWaitNaming) { Text("Wait") }
+            },
+            dismissButton = {
+                TextButton(onClick = onCancelNaming) { Text("Cancel") }
+            }
+        )
     }
 }
