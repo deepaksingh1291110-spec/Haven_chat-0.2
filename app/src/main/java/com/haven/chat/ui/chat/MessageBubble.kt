@@ -31,6 +31,16 @@
 //      answer as Gemma wrote it, in Markdown (so ** and ``` stay in it,
 //      which is what you want when you paste code).
 //   3) Code blocks get their own "Copy" button in MarkdownText.kt.
+//
+// CRASH FIX (marked "CRASH FIX"):
+//   Selecting text in the answer that Gemma is STILL WRITING crashed the
+//   app: the text changes many times a second and the selection points
+//   into text that no longer matches. Now MessageBubble() has a flag
+//   "selectable". ChatScreen sets it to false only for the LAST message
+//   while Gemma is busy. That bubble (answer and thinking text) is drawn
+//   without a SelectionContainer, so nothing can be selected and nothing
+//   can crash. All older messages stay selectable during streaming, and
+//   the new answer becomes selectable as soon as it is finished.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -78,12 +88,17 @@ import kotlinx.coroutines.delay
 
 // PUBLIC entry point. The chat screen calls only this function.
 // It looks at who wrote the message and picks the right bubble.
+//
+// CRASH FIX: "selectable" is false ONLY for the answer that Gemma is still
+// writing (ChatScreen decides). While text streams in, a selection would
+// point into text that keeps changing, and Compose can crash. When the
+// answer is finished, ChatScreen passes true and the text can be selected.
 @Composable
-fun MessageBubble(message: ChatMessage) {
+fun MessageBubble(message: ChatMessage, selectable: Boolean = true) {
     if (message.role == Role.USER) {
         UserBubble(message)
     } else {
-        AssistantBubble(message)
+        AssistantBubble(message, selectable)
     }
 }
 
@@ -122,7 +137,7 @@ private fun UserBubble(message: ChatMessage) {
 //      "copy whole answer" icon at its end
 // ---------------------------------------------------------------------
 @Composable
-private fun AssistantBubble(message: ChatMessage) {
+private fun AssistantBubble(message: ChatMessage, selectable: Boolean) {
     Row(
         // start = 16 dp on the left, end = 48 dp on the RIGHT: this is
         // the free space your design has next to the AI bubble.
@@ -140,7 +155,7 @@ private fun AssistantBubble(message: ChatMessage) {
         ) {
             // Part 1: thinking box. "?.let" means: run only if thinking is not null.
             message.thinking?.let { thinkingText ->
-                ThinkingBox(thinkingText)
+                ThinkingBox(thinkingText, selectable)
                 // Small gap under the box.
                 Spacer(modifier = Modifier.height(8.dp))
             }
@@ -154,15 +169,22 @@ private fun AssistantBubble(message: ChatMessage) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             } else {
-                // COPY: SelectionContainer makes everything inside selectable:
-                // paragraphs, list items, code blocks.
                 // MarkdownText turns **bold**, lists, `code` ... into real formatting.
-                SelectionContainer {
+                val answerContent: @Composable () -> Unit = {
                     MarkdownText(
                         text = message.text,
                         color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodyLarge
                     )
+                }
+                // COPY: SelectionContainer makes everything inside selectable:
+                // paragraphs, list items, code blocks.
+                // CRASH FIX: but NOT while this answer is still being written
+                // (selectable = false): then it is drawn without a container.
+                if (selectable) {
+                    SelectionContainer { answerContent() }
+                } else {
+                    answerContent()
                 }
             }
 
@@ -233,7 +255,7 @@ private fun CopyAnswerButton(text: String) {
 // The collapsible "Thinking process" box. Tap the header to open/close.
 // ---------------------------------------------------------------------
 @Composable
-private fun ThinkingBox(thinkingText: String) {
+private fun ThinkingBox(thinkingText: String, selectable: Boolean) {
     // "remember" keeps the value while the screen is on.
     // "mutableStateOf" makes Compose REDRAW when the value changes.
     var expanded by remember { mutableStateOf(false) }
@@ -269,15 +291,21 @@ private fun ThinkingBox(thinkingText: String) {
 
         // The thinking text slides in only when expanded is true.
         // It is drawn as Markdown too, so its lists and bold text look right.
-        // COPY: it is selectable as well (only while it is open).
+        // COPY: it is selectable as well (only while it is open), and
+        // CRASH FIX: not while it is still being written (selectable = false).
         AnimatedVisibility(visible = expanded) {
-            SelectionContainer {
+            val thinkingContent: @Composable () -> Unit = {
                 MarkdownText(
                     text = thinkingText,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp)
                 )
+            }
+            if (selectable) {
+                SelectionContainer { thinkingContent() }
+            } else {
+                thinkingContent()
             }
         }
     }

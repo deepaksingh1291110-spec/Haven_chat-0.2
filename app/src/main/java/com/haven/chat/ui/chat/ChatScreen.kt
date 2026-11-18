@@ -33,6 +33,11 @@
 //      chats), a message sent by the user is held back and this popup is
 //      shown:  [Cancel]  [Wait].  The ViewModel decides what they do.
 //      Closing the popup by tapping outside counts as "Wait".
+//
+// CRASH FIX (after Phase 3, with the copy feature):
+//   Selecting text in the answer that is still being written crashed the
+//   app. Now the LAST bubble is told "selectable = false" while Gemma is
+//   busy (isGenerating). See MessageBubble.kt.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -213,7 +218,12 @@ fun ChatScreen(
                 // "key" gives each message a stable identity (its id),
                 // so Compose does not redraw everything when one is added.
                 items(messages, key = { it.id }) { message ->
-                    MessageBubble(message)
+                    // CRASH FIX: the LAST bubble is not selectable while Gemma
+                    // is busy writing it (its text changes many times a second,
+                    // and a selection on it crashed the app). Older messages
+                    // stay selectable, and so does the new answer once it is done.
+                    val isStreamingBubble = isGenerating && message.id == last?.id
+                    MessageBubble(message, selectable = !isStreamingBubble)
                 }
             }
 
