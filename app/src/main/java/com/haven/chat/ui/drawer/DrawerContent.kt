@@ -31,6 +31,19 @@
 //     features that speed up Gemma (NEON, DOTPROD, I8MM...) and how many
 //     of the phone's cores are used. The facts come from HardwareInfo.kt.
 //     No new parameters are needed: the card reads them once by itself.
+//
+// PHASE 4 CHANGES (marked "PHASE 4"): DELETE ASKS ABOUT MEMORIES FIRST.
+//   The delete dialog now has THREE buttons:
+//     1) "Save personal things, then delete"  -> onSaveAndDeleteChat(id)
+//        Gemma first finds the personal things in the chat and saves them
+//        as memories; the chat is deleted only when that worked.
+//     2) "Delete without saving"              -> onDeleteChat(id)
+//        The old behaviour: the chat and its messages are deleted at once.
+//     3) "Cancel"                             -> nothing happens.
+//   Memories that were saved before stay in every case: deleting a chat
+//   never deletes its memories.
+//   The new callback has a default value ({}), so this file compiles even
+//   before HavenApp.kt passes it.
 // =====================================================================
 package com.haven.chat.ui.drawer
 
@@ -113,7 +126,8 @@ fun DrawerContent(
     onNewChatClick: () -> Unit,
     onChatClick: (Long) -> Unit,         // gives the id of the tapped chat
     onRenameChat: (Long, String) -> Unit, // PHASE 3: chat id and the new title
-    onDeleteChat: (Long) -> Unit,        // PHASE 3: chat id (after the user confirmed)
+    onDeleteChat: (Long) -> Unit,        // PHASE 3: chat id (after the user chose "Delete without saving")
+    onSaveAndDeleteChat: (Long) -> Unit = {}, // PHASE 4: chat id (after the user chose "Save personal things, then delete")
     onSettingsClick: () -> Unit,
     onCloseClick: () -> Unit
 ) {
@@ -262,7 +276,10 @@ fun DrawerContent(
         )
     }
 
-    // DELETE confirmation dialog
+    // DELETE dialog
+    // PHASE 4: three choices instead of two. Material's AlertDialog has only
+    // two button slots, so the three buttons are stacked in the "confirm"
+    // slot, one under the other, each on its own line (the labels are long).
     deleteTarget?.let { chat ->
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
@@ -270,21 +287,39 @@ fun DrawerContent(
             text = {
                 Text(
                     "\"${chat.title}\" and all its messages will be deleted from " +
-                            "this phone. This cannot be undone."
+                            "this phone. This cannot be undone.\n\n" +
+                            "Gemma can first save the personal things from this chat " +
+                            "as memories. Saved memories stay even after the chat is deleted."
                 )
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        onDeleteChat(chat.id)
-                        deleteTarget = null
-                    }
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.End
                 ) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                    // 1) Save the personal things first, then delete.
+                    TextButton(
+                        onClick = {
+                            onSaveAndDeleteChat(chat.id)
+                            deleteTarget = null
+                        }
+                    ) {
+                        Text("Save personal things, then delete")
+                    }
+                    // 2) The old behaviour: delete at once.
+                    TextButton(
+                        onClick = {
+                            onDeleteChat(chat.id)
+                            deleteTarget = null
+                        }
+                    ) {
+                        Text("Delete without saving", color = MaterialTheme.colorScheme.error)
+                    }
+                    // 3) Do nothing.
+                    TextButton(onClick = { deleteTarget = null }) {
+                        Text("Cancel")
+                    }
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
             }
         )
     }

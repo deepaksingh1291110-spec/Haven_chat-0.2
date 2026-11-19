@@ -33,11 +33,11 @@
 //   the user types in Settings (64 to 32768, default 2048). The engine still
 //   stops earlier if the context window is full.
 //
-// PHASE 4 (everything new is marked "PHASE 4"): REMEMBER PERSONAL THINGS.
-//   1) The typed phrase "remember my personal things from this chat" (and,
-//      later, a menu item that calls rememberPersonalThings()) starts the
-//      memory job INSTEAD of a normal message. The phrase is never saved
-//      as a chat message and never sent to Gemma as a question.
+// PHASE 4, STEP 3 (marked "PHASE 4"): REMEMBER PERSONAL THINGS.
+//   1) The typed phrase "remember my personal things from this chat" (and
+//      the bookmark button, which calls rememberPersonalThings()) starts
+//      the memory job INSTEAD of a normal message. The phrase is never
+//      saved as a chat message and never sent to Gemma as a question.
 //   2) The job itself is MemoryExtractor.kt: Gemma only DECIDES which of
 //      the user's messages are personal; the app copies each personal
 //      question and its saved final answer, word for word, into the
@@ -45,14 +45,28 @@
 //      never deletes its memories.
 //   3) While the job runs, "memoryJob" holds the progress for a dialog
 //      (progress, a Cancel button, and at the end a short result text).
-//      The dialog is drawn by ChatScreen / HavenApp (next files).
+//      The dialog is drawn by ChatScreen.
 //   4) While it runs, nothing else may start (sending, opening, new chat,
 //      delete): our "working" flag AND the engine state MEMORIZING block
 //      them. At the end the open chat is put back into Gemma's head.
 //
+// PHASE 4, STEP 4 (marked "PHASE 4 / DELETE"): DELETE SAVES MEMORIES FIRST.
+//   The drawer's delete dialog has three buttons. This file serves two:
+//     - deleteChatSavingMemories(id)  "Save personal things, then delete":
+//         runs the SAME memory job on that chat. ONLY when the job is
+//         COMPLETE (everything after the chat's marker was checked and
+//         saved) is the chat deleted. If the job fails, is cancelled, or
+//         the model is not loaded, the chat is NOT deleted and the dialog
+//         says so. Because the marker is saved after every batch, a second
+//         try continues where the first one stopped.
+//     - deleteChat(id)                "Delete without saving": deletes at
+//         once, as before.
+//   In both cases the chat's marker row is removed after the chat is gone.
+//   Memories that were saved stay, always.
+//   The progress / result dialog is the same one as for "remember" (memoryJob).
+//
 // STILL TEMPORARY:
 //   - No Agent and no memory SEARCH yet (later steps of Phase 4).
-//   - Delete chat does not save personal things first yet (step 4).
 //
 // IDS: messages shown on screen need a unique id for the list. Messages
 //   loaded from the database keep their database id (positive numbers).
@@ -109,9 +123,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // PHASE 3: the one place that saves and loads chats.
     private val repo = ChatRepository(application)
 
+    // PHASE 4: the one place that saves and loads memories (and the
+    // per-chat markers).
+    private val memoryRepo = MemoryRepository(application)
+
     // PHASE 4: the job that finds the personal messages of a chat and
     // saves them (it uses the chat repository and the memory repository).
-    private val extractor = MemoryExtractor(repo, MemoryRepository(application))
+    private val extractor = MemoryExtractor(repo, memoryRepo)
 
     // ----- STATE (data the screen shows) -----
     // "mutableStateOf" = when this value changes, Compose redraws.
@@ -134,7 +152,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     // PHASE 4: the state of the memory dialog. null = no dialog is shown.
-    // ChatScreen / HavenApp draw it (next files).
+    // ChatScreen draws it. It is used by BOTH the "remember" job and the
+    // "save personal things, then delete" job.
     var memoryJob by mutableStateOf<MemoryJobUi?>(null)
         private set
 
@@ -456,26 +475,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repo.renameChat(chatId, title) }
     }
 
-    // PHASE 3: "..." menu > Delete (after the user confirmed).
+    // PHASE 3: "..." menu > Delete > "Delete without saving".
     // The database removes the chat AND all its messages, and wipes them
     // from the file (secure_delete).
+    // PHASE 4 / DELETE: the chat's marker row is removed too (the memories
+    // themselves stay).
     fun deleteChat(chatId: Long) {
         // Not while Gemma is writing: the answer would have no chat to go to.
         if (working || EngineManager.isBusy) return
         working = true
         viewModelScope.launch {
-            repo.deleteChat(chatId)
-            // If it was the open chat, show an empty new chat, and make
-            // Gemma forget it too.
-            if (currentChatId == chatId) showEmptyChat()
-            working = false
+            try {
+                removeChat(chatId)
+            } finally {
+                working = false
+            }
         }
     }
 
     // ----- PHASE 4: REMEMBER PERSONAL THINGS -----
 
     // PHASE 4: starts the memory job for the OPEN chat. Called by the typed
-    // phrase (see sendMessage) and, in the next files, by a menu item.
+    // phrase (see sendMessage) and by the bookmark button.
     // Whatever happens, the user gets a dialog (progress, or a short text).
     fun rememberPersonalThings() {
         // The dialog is already open (a job is running or its result is
@@ -503,6 +524,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        startMemoryJob(chatId, deleteChatAfter = false)
+    }
+
+    // PHASE 4 / DELETE: the delete dialog's "Save personal things, then
+    // delete". Runs the memory job on that chat and deletes it ONLY when
+    // the job is complete. The drawer already switches Delete off while
+    // Gemma is busy; the checks here are a second safety.
+    fun deleteChatSavingMemories(chatId: Long) {
+        if (memoryJob != null) return
+
+        if (working || EngineManager.isBusy) {
+            memoryJob = MemoryJobUi(
+                running = false,
+                message = "Gemma is busy. Try again in a moment. The chat was not deleted."
+            )
+            return
+        }
+
+        startMemoryJob(chatId, deleteChatAfter = true)
+    }
+
+    // PHASE 4: the memory job for one chat, used by BOTH actions above.
+    //   deleteChatAfter = false : "remember" (just save the memories).
+    //   deleteChatAfter = true  : "save, then delete": the chat is deleted
+    //                             ONLY when the job is COMPLETE.
+    // The result dialog (memoryJob) tells the user what happened.
+    private fun startMemoryJob(chatId: Long, deleteChatAfter: Boolean) {
         working = true
         memoryJob = MemoryJobUi(running = true)
         val s = SettingsViewModel.active
@@ -515,7 +563,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     systemPrompt = SettingsViewModel.systemPromptOf(s),
                     chatThinking = s.thinkingEnabled,
                     // Called at the END of the job, on the main thread: the
-                    // open chat is put back into Gemma's head.
+                    // chat that is open on screen is put back into Gemma's
+                    // head. (If that chat is about to be deleted, removeChat
+                    // starts a fresh conversation right after.)
                     restoreHistory = { historyForEngine(messages) },
                     onProgress = { p ->
                         memoryJob = MemoryJobUi(
@@ -526,13 +576,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 )
-                MemoryJobUi(running = false, saved = result.saved, message = memoryMessage(result))
+
+                when {
+                    // Not complete (error, cancel, model not loaded...): the
+                    // chat is NOT deleted, whatever was asked.
+                    !result.completed ->
+                        MemoryJobUi(
+                            running = false,
+                            saved = result.saved,
+                            message = memoryMessage(result) +
+                                    (if (deleteChatAfter) NOT_DELETED_HINT else "")
+                        )
+
+                    // "Remember" only: nothing to delete.
+                    !deleteChatAfter ->
+                        MemoryJobUi(running = false, saved = result.saved, message = memoryMessage(result))
+
+                    // Complete AND delete wanted: delete now.
+                    removeChat(chatId) ->
+                        MemoryJobUi(
+                            running = false,
+                            saved = result.saved,
+                            message = deletedMessage(result.saved)
+                        )
+
+                    // The memories are saved, but the delete itself failed.
+                    else ->
+                        MemoryJobUi(
+                            running = false,
+                            saved = result.saved,
+                            message = "The personal things were saved, but the chat could " +
+                                    "not be deleted. Try deleting it again."
+                        )
+                }
             } catch (e: CancellationException) {
                 throw e      // the ViewModel is being destroyed: let it stop
             } catch (e: Exception) {
                 MemoryJobUi(
                     running = false,
-                    message = "Something went wrong: " + (e.message ?: e.javaClass.simpleName)
+                    message = "Something went wrong: " + (e.message ?: e.javaClass.simpleName) +
+                            (if (deleteChatAfter) NOT_DELETED_HINT else "")
                 )
             } finally {
                 working = false
@@ -542,7 +625,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // PHASE 4: the dialog's Cancel button. The batch that Gemma is reading
-    // is interrupted; what earlier batches saved stays saved.
+    // is interrupted; what earlier batches saved stays saved. (In the
+    // delete flow the chat is then NOT deleted.)
     fun cancelMemoryJob() {
         extractor.cancel()
     }
@@ -560,6 +644,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ----- HELPERS -----
+
+    // PHASE 4 / DELETE: deletes the chat (its messages go with it), then its
+    // marker row, and clears the screen if it was the open chat.
+    // Returns true when the chat is gone, false when the database refused.
+    // A problem while removing the marker is ignored on purpose: a left-over
+    // marker is harmless (chat ids are never reused).
+    private suspend fun removeChat(chatId: Long): Boolean {
+        try {
+            repo.deleteChat(chatId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return false
+        }
+        try {
+            memoryRepo.removeMarker(chatId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // harmless, see above
+        }
+        // If it was the open chat, show an empty new chat, and make
+        // Gemma forget it too.
+        if (currentChatId == chatId) showEmptyChat()
+        return true
+    }
 
     // Shows a clean new chat and resets the conversation inside the engine.
     private fun showEmptyChat() {
@@ -610,8 +720,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "Done. " + memoriesText(r.saved) + " saved from this chat."
     }
 
+    // PHASE 4 / DELETE: the result text after "save, then delete" worked.
+    private fun deletedMessage(saved: Int): String =
+        if (saved == 0) "No new personal things were found. The chat was deleted."
+        else memoriesText(saved) + " saved. The chat was deleted."
+
     companion object {
         // PHASE 4: the typed phrase that starts the memory job.
         const val MEMORY_COMMAND = "remember my personal things from this chat"
+
+        // PHASE 4 / DELETE: added to the dialog text when the chat was NOT
+        // deleted because the job was not complete.
+        private const val NOT_DELETED_HINT =
+            "\nThe chat was NOT deleted. You can try again, or choose \"Delete without saving\"."
     }
 }

@@ -34,13 +34,20 @@
 //     saved settings are loaded before the chat uses them.
 //
 // PHASE 4 CHANGES (marked "PHASE 4"): REMEMBER PERSONAL THINGS.
+//   Step 3:
 //   - The chat screen gets four new connections: the bookmark button
 //     (onRememberClick), the memory dialog state (memoryJob) and its two
 //     buttons (onCancelMemory, onDismissMemory). They all go straight to
 //     ChatViewModel.
-//   - Nothing else changed. While the memory job runs, EngineManager.isBusy
-//     is true (state MEMORIZING), so the drawer ignores "New chat" and
-//     chat taps and shows its "Gemma is busy" hint, as it does for naming.
+//   - While the memory job runs, EngineManager.isBusy is true (state
+//     MEMORIZING), so the drawer ignores "New chat" and chat taps and
+//     shows its "Gemma is busy" hint, as it does for naming.
+//   Step 4 (marked "PHASE 4 / DELETE"):
+//   - The drawer's delete dialog has a new choice, "Save personal things,
+//     then delete". It calls chatViewModel.deleteChatSavingMemories(id)
+//     and CLOSES the drawer, so the memory dialog (progress, Cancel, then
+//     the result) is visible on the chat screen. "Delete without saving"
+//     still calls chatViewModel.deleteChat(id), as before.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -146,8 +153,16 @@ fun HavenApp(
                             onRenameChat = { chatId, title ->
                                 chatViewModel.renameChat(chatId, title)      // PHASE 3
                             },
+                            // "Delete without saving": deletes at once (as before).
                             onDeleteChat = { chatId ->
                                 chatViewModel.deleteChat(chatId)             // PHASE 3
+                            },
+                            // PHASE 4 / DELETE: "Save personal things, then
+                            // delete". The drawer closes so the memory dialog
+                            // (progress, Cancel, result) is visible.
+                            onSaveAndDeleteChat = { chatId ->
+                                chatViewModel.deleteChatSavingMemories(chatId)
+                                scope.launch { drawerState.close() }
                             },
                             onSettingsClick = {
                                 scope.launch { drawerState.close() }
@@ -189,7 +204,7 @@ fun HavenApp(
                     onCancelNaming = { chatViewModel.cancelNaming() },
                     // PHASE 4: the bookmark button starts "remember my
                     // personal things from this chat"; the dialog shows
-                    // its progress and result.
+                    // its progress and result (also for "save, then delete").
                     onRememberClick = { chatViewModel.rememberPersonalThings() },
                     memoryJob = chatViewModel.memoryJob,
                     onCancelMemory = { chatViewModel.cancelMemoryJob() },
