@@ -24,7 +24,7 @@
         android:label="Haven Chat"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:supportsRtl="true"
         android:theme="@style/Theme.Haven.Splash">
         <!-- The theme above is a plain built-in one with no top bar.

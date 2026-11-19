@@ -28,6 +28,11 @@
 //   8) It is now an AndroidViewModel (needs the Application to reach the
 //      database). HavenApp still creates it with viewModel().
 //
+// MAX REPLY LENGTH (after Phase 3): the reply limit is no longer a fixed
+//   1024. Each send uses SettingsViewModel.active.maxReplyTokens, the number
+//   the user types in Settings (64 to 32768, default 2048). The engine still
+//   stops earlier if the context window is full.
+//
 // STILL TEMPORARY:
 //   - No Agent and no long-term memory yet (Phase 4).
 //
@@ -113,8 +118,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ----- PRIVATE PARTS -----
 
-    // Longest answer we allow (in tokens). Phase 5 can make it a setting.
-    private val maxNewTokens = 1024
+    // (The longest reply used to be fixed at 1024 tokens here. It is now the
+    //  setting "Max reply length" that the user types in Settings, read at
+    //  every send in startGeneration().)
 
     // Counter for temporary ids of messages made in this session.
     // It counts DOWN (-1, -2, -3...), see "IDS" at the top.
@@ -212,14 +218,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val answerSoFar = StringBuilder()
         val thinkingSoFar = StringBuilder()
 
-        // The thinking switch comes from the Settings screen.
+        // The thinking switch and the longest reply (in tokens, thinking
+        // included) come from the Settings screen.
         val thinkingOn = SettingsViewModel.active.thinkingEnabled
+        val maxReply = SettingsViewModel.active.maxReplyTokens
 
         // All three callbacks run on the main thread, so changing
         // "messages" here is safe.
         EngineManager.generate(
             userText = userText,
-            maxNewTokens = maxNewTokens,
+            maxNewTokens = maxReply,
             thinking = thinkingOn,
 
             // A piece of THINKING text arrived.

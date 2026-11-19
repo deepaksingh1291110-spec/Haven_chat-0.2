@@ -19,7 +19,7 @@
 // STATUS: "state" is Compose state. When it changes, any screen that
 //       reads it redraws by itself (the chip under the chat title).
 //
-// NOT USED HERE (on purpose): Agent, tools, memory (that is Phase 4).
+// NOT USED HERE (on purpose): Agent, tools, memory SEARCH (later steps).
 //
 // ---------------------------------------------------------------------
 // PHASE 3 CHANGES (everything new is marked "PHASE 3"):
@@ -35,7 +35,25 @@
 //      the engine is restored, so the title question never leaks into
 //      the real chat.
 //   5) contextSize is remembered after loading.
-// Everything else works as before.
+//
+// PHASE 4 CHANGES (everything new is marked "PHASE 4"):
+//   The job "find the PERSONAL messages of a chat" (memory extraction).
+//   1) New state MEMORIZING: Gemma is classifying messages. It is a BUSY
+//      state like NAMING (isBusy covers it, the chip says "Saving
+//      memories...").
+//   2) startMemorizing(): READY -> MEMORIZING. Stays MEMORIZING for the
+//      WHOLE job (all batches), so the user cannot send a message or open
+//      a chat in between.
+//   3) classifyBatch(): ONE batch. Every attempt starts a CLEAN
+//      conversation with the extraction prompt (MemoryPrompts.kt), sends
+//      the numbered list of user messages and reads Gemma's JSON reply.
+//      If the reply is not understood it tries ONE more time.
+//      The text Gemma writes is never saved anywhere: only the NUMBERS in
+//      it are used.
+//   4) finishMemorizing(): puts the open chat back into Gemma's head
+//      (like after a title) and sets the state back to READY.
+//   5) cancelMemorizing(): stops the running batch (same as stop()).
+//   Everything else works as before.
 // =====================================================================
 package com.haven.chat.engine
 
@@ -60,6 +78,7 @@ object EngineManager {
         READY,        // model loaded, waiting for a question
         THINKING,     // Gemma is writing an answer right now
         NAMING,       // PHASE 3: Gemma is writing a chat title (hidden, short)
+        MEMORIZING,   // PHASE 4: Gemma is finding the personal messages of a chat
         ERROR         // something failed; see errorMessage
     }
 
@@ -100,12 +119,18 @@ object EngineManager {
             else if (thinkingSeen) "Thinking..."
             else "Reading..."
         State.NAMING -> "Naming chat..."      // PHASE 3
+        State.MEMORIZING -> "Saving memories..."   // PHASE 4
         State.ERROR -> "Error"
     }
 
-    /** PHASE 3: true while the engine cannot take a new job (loading, answering or naming). */
+    /**
+     * PHASE 3: true while the engine cannot take a new job (loading,
+     * answering, naming).
+     * PHASE 4: and while it is memorizing.
+     */
     val isBusy: Boolean
-        get() = state == State.LOADING || state == State.THINKING || state == State.NAMING
+        get() = state == State.LOADING || state == State.THINKING ||
+                state == State.NAMING || state == State.MEMORIZING
 
     // -----------------------------------------------------------------
     // PHASE 3: one old message, handed over by the ChatViewModel
@@ -137,6 +162,27 @@ object EngineManager {
     )
 
     // -----------------------------------------------------------------
+    // PHASE 4: result of one classifyBatch() call
+    // -----------------------------------------------------------------
+    /**
+     * personal  the numbers (1 = first message of the batch) that Gemma
+     *           marked PERSONAL. An EMPTY list is a valid answer ("none is
+     *           personal"). null = the reply could not be understood, even
+     *           after the second try (see "error" and "cancelled" first).
+     * cancelled true if the user cancelled while the batch was running.
+     * error     a plain-words problem (for example "conversation too
+     *           long"), or null.
+     *
+     * Rule for the caller: ONLY when personal != null may the marker move
+     * forward. In every other case the batch must be treated as NOT done.
+     */
+    class BatchResult(
+        val personal: List<Int>?,
+        val cancelled: Boolean,
+        val error: String?
+    )
+
+    // -----------------------------------------------------------------
     // PHASE 3: numbers used when an old chat is put back into Gemma
     // -----------------------------------------------------------------
 
@@ -158,6 +204,10 @@ object EngineManager {
         "Write a short title for this conversation, at most 6 words, " +
         "in the same language as my first message. " +
         "Reply with the title only: no quotes, no full stop."
+
+    // PHASE 4: how many times one batch is tried when Gemma's reply cannot
+    // be understood (1 first try + 1 more try).
+    private const val MEMORY_ATTEMPTS = 2
 
     // -----------------------------------------------------------------
     // Private parts
@@ -246,7 +296,7 @@ object EngineManager {
         thinking: Boolean = true,
         onDone: (String?) -> Unit
     ) {
-        // PHASE 3: "isBusy" now also covers NAMING.
+        // PHASE 3: "isBusy" now also covers NAMING (and, PHASE 4, MEMORIZING).
         if (isBusy) {
             onDone("The engine is busy. Wait a moment and try again.")
             return
@@ -350,7 +400,7 @@ object EngineManager {
                 onMain { onDone(n) }
             }
             State.NOT_LOADED, State.ERROR -> onDone(0)
-            else -> onDone(-1)    // loading, answering or naming
+            else -> onDone(-1)    // loading, answering, naming or memorizing
         }
     }
 
@@ -437,6 +487,7 @@ object EngineManager {
             val msg = when (state) {
                 State.THINKING -> "Gemma is still answering."
                 State.NAMING -> "Gemma is still naming the chat. Try again in a moment."   // PHASE 3
+                State.MEMORIZING -> "Gemma is still saving memories. Try again in a moment."   // PHASE 4
                 else -> "No model is loaded. Open Settings and tap Load Model."
             }
             onDone(Result("", "", null, null, false, msg))
@@ -605,6 +656,157 @@ object EngineManager {
         t = t.trimEnd('.', '!', ' ')
         if (t.length > TITLE_MAX_CHARS) t = t.take(TITLE_MAX_CHARS).trimEnd()
         return if (t.isEmpty()) null else t
+    }
+
+    // -----------------------------------------------------------------
+    // PHASE 4: memory extraction (find the PERSONAL messages of a chat)
+    // -----------------------------------------------------------------
+    // The job has THREE parts, called one after another by MemoryExtractor:
+    //   startMemorizing()      once, at the start  (READY -> MEMORIZING)
+    //   classifyBatch(...)     once per batch of up to 15 user messages
+    //   finishMemorizing(...)  once, at the end    (MEMORIZING -> READY)
+    // The state stays MEMORIZING the whole time, so the rest of the app
+    // sees the engine as busy (no sending, opening or deleting meanwhile).
+    // The caller MUST always call finishMemorizing(), also after an error
+    // or a cancel, otherwise the engine stays "busy".
+
+    /**
+     * Starts the memory job. Call it on the main thread.
+     * Returns null when it started, or a plain-words problem text (for
+     * example "No model is loaded...") when it could not start.
+     */
+    fun startMemorizing(): String? {
+        return when (state) {
+            State.READY -> {
+                stopRequested = false
+                setState(State.MEMORIZING)
+                null
+            }
+            State.NOT_LOADED, State.ERROR ->
+                "No model is loaded. Open Settings and tap Load Model."
+            else ->
+                "Gemma is busy. Try again in a moment."
+        }
+    }
+
+    /**
+     * Gemma reads ONE batch and says which messages are personal.
+     *   batchMessage  the numbered list from MemoryPrompts.buildBatchMessage()
+     *   batchSize     how many messages the list has (valid numbers 1..batchSize)
+     *   thinking      the "memory thinking" switch of the Settings screen
+     * onDone runs on the main thread with a BatchResult (see its notes).
+     *
+     * Every attempt first starts a CLEAN conversation with the extraction
+     * system prompt, so Gemma never sees the user's chat or an earlier
+     * batch. (The price: the short system prompt is read again for every
+     * batch.) Nothing Gemma writes is shown or saved; only the numbers in
+     * its reply are used.
+     */
+    fun classifyBatch(
+        batchMessage: String,
+        batchSize: Int,
+        thinking: Boolean,
+        onDone: (BatchResult) -> Unit
+    ) {
+        if (state != State.MEMORIZING) {
+            onDone(BatchResult(null, false, "The memory job was not started."))
+            return
+        }
+
+        worker.execute {
+            val b = bridge
+            if (b == null) {
+                onMain { onDone(BatchResult(null, false, "The engine is not started.")) }
+                return@execute
+            }
+
+            val result: BatchResult = try {
+                var personal: List<Int>? = null
+                var error: String? = null
+                var cancelled = false
+                var attempt = 0
+
+                // Try again only when the reply was not understood.
+                while (attempt < MEMORY_ATTEMPTS && personal == null && error == null && !cancelled) {
+                    attempt++
+
+                    // The user may have pressed Cancel between two batches.
+                    if (stopRequested) {
+                        cancelled = true
+                        break
+                    }
+
+                    // Clean conversation with the extraction prompt.
+                    b.resetChat(MemoryPrompts.EXTRACTION_SYSTEM_PROMPT.toByteArray(Charsets.UTF_8))
+
+                    // The listener IGNORES the text. It only answers
+                    // "keep going" (true) or "stop" (false).
+                    val listener = object : ChatListener {
+                        override fun onDelta(kind: Int, bytes: ByteArray): Boolean = !stopRequested
+                    }
+                    val stats = b.generate(
+                        batchMessage.toByteArray(Charsets.UTF_8),
+                        MemoryPrompts.maxNewTokens(thinking),
+                        thinking,
+                        listener
+                    )
+
+                    when {
+                        stopRequested || stats.startsWith("STOPPED") ->
+                            cancelled = true
+                        stats.startsWith("ERROR") ->
+                            error = stats.removePrefix("ERROR:").trim()
+                        else ->
+                            // lastAnswer() = the FINAL answer only (no thinking text).
+                            personal = MemoryPrompts.parsePersonalNumbers(b.lastAnswer(), batchSize)
+                    }
+                }
+                BatchResult(personal, cancelled, error)
+            } catch (t: Throwable) {
+                BatchResult(null, false, "Reading the messages failed: " + (t.message ?: t.javaClass.simpleName))
+            }
+
+            onMain { onDone(result) }
+        }
+    }
+
+    /**
+     * Ends the memory job. ALWAYS call it (after success, error or cancel).
+     * It puts the chat that should be open back into Gemma's head and sets
+     * the state back to READY.
+     *   systemPrompt  the user's normal system prompt
+     *   history       the messages of the chat that stays open (oldest
+     *                 first, same list as for openChat). Give an EMPTY
+     *                 list when the chat is going away (it was deleted):
+     *                 Gemma then starts a fresh chat.
+     *   thinking      the normal thinking setting (reply reserve, as in openChat)
+     * onDone runs on the main thread.
+     */
+    fun finishMemorizing(
+        systemPrompt: String,
+        history: List<HistoryItem>,
+        thinking: Boolean,
+        onDone: () -> Unit
+    ) {
+        if (state != State.MEMORIZING) {
+            onDone()
+            return
+        }
+        worker.execute {
+            val b = bridge
+            try {
+                if (b != null) replayOnWorker(b, systemPrompt, history, thinking)
+            } catch (t: Throwable) {
+                // The next generate() reports real problems.
+            }
+            setState(State.READY)
+            onMain { onDone() }
+        }
+    }
+
+    /** PHASE 4: cancels the running batch (same as stop). Safe any time. */
+    fun cancelMemorizing() {
+        stop()
     }
 
     // -----------------------------------------------------------------

@@ -24,6 +24,13 @@
 //       real code inside (two steps in one go), and Room supports that
 //       most safely in an abstract class.
 //
+// PHASE 4 CHANGE (the only change in this file, marked "PHASE 4"):
+//   New function getMessagesAfter() and the small class MessageBrief.
+//   They let the memory extraction read only the messages that are NEWER
+//   than the chat's "last-done marker" (see MemoryEntities.kt), and only
+//   the columns it needs (not the thinking text, which can be long).
+//   Nothing else in this file was changed.
+//
 // USED BY: HavenDatabase.kt (creates it), ChatRepository.kt (calls it)
 // =====================================================================
 package com.haven.chat.data
@@ -33,6 +40,24 @@ import androidx.room.Insert
 import androidx.room.Query
 import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
+
+// ---------------------------------------------------------------------
+// PHASE 4 (NEW): a SHORT version of a message, for the memory extraction.
+// It has only what the extraction needs:
+//   id         the real database id of the message (the marker is an id)
+//   role       "USER" or "ASSISTANT"
+//   text       the visible text (for an answer: the FINAL answer, never
+//              the thinking text, which is stored in another column)
+//   createdAt  when it was saved (milliseconds since 1970)
+// Room fills it from the column names of the query below, so the names
+// here MUST be the same as the column names in the SELECT.
+// ---------------------------------------------------------------------
+data class MessageBrief(
+    val id: Long,
+    val role: String,
+    val text: String,
+    val createdAt: Long
+)
 
 @Dao
 abstract class ChatDao {
@@ -99,6 +124,23 @@ abstract class ChatDao {
     // so sorting by id keeps the order in which they were written).
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY id ASC")
     abstract suspend fun getMessages(chatId: Long): List<MessageEntity>
+
+    // PHASE 4 (NEW): the messages of a chat that are NEWER than the marker,
+    // oldest first, in the short form (no thinking text).
+    //   afterId = the marker: the id of the last message already checked.
+    //             0 = the chat was never read, so everything is returned
+    //             (real message ids start at 1).
+    // Both USER and ASSISTANT messages are returned, in the order they were
+    // written. The extraction needs the answers too: it saves the final
+    // answer that follows each personal question.
+    @Query(
+        """
+        SELECT id, role, text, createdAt FROM messages
+        WHERE chatId = :chatId AND id > :afterId
+        ORDER BY id ASC
+        """
+    )
+    abstract suspend fun getMessagesAfter(chatId: Long, afterId: Long): List<MessageBrief>
 
     // Adds one message row. Returns its new id.
     @Insert

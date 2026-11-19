@@ -17,7 +17,8 @@
 //
 // WHAT IS SAVED: every field of AppSettings (see SettingsScreen.kt):
 //       threads, contextSize, thinkingEnabled, modelPath, systemPrompt,
-//       stopSequence and (new) autoNameChats.
+//       stopSequence, autoNameChats and maxReplyTokens (the longest reply,
+//       typed by the user; added after Phase 3).
 //
 // IF A VALUE IS MISSING (first start, or a new setting added later), the
 // default from AppSettings is used. So adding new settings in future
@@ -39,6 +40,8 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.haven.chat.ui.settings.AppSettings
+import com.haven.chat.ui.settings.MAX_REPLY_TOKENS
+import com.haven.chat.ui.settings.MIN_REPLY_TOKENS
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import java.io.IOException
@@ -67,6 +70,7 @@ class SettingsStore(context: Context) {
         val SYSTEM_PROMPT = stringPreferencesKey("system_prompt")
         val STOP_SEQUENCE = stringPreferencesKey("stop_sequence")
         val AUTO_NAME = booleanPreferencesKey("auto_name_chats")
+        val MAX_REPLY = intPreferencesKey("max_reply_tokens")      // longest reply (tokens)
     }
 
     /**
@@ -97,7 +101,10 @@ class SettingsStore(context: Context) {
             modelPath = p[Keys.MODEL_PATH] ?: d.modelPath,
             systemPrompt = p[Keys.SYSTEM_PROMPT] ?: d.systemPrompt,
             stopSequence = p[Keys.STOP_SEQUENCE] ?: d.stopSequence,
-            autoNameChats = p[Keys.AUTO_NAME] ?: d.autoNameChats
+            autoNameChats = p[Keys.AUTO_NAME] ?: d.autoNameChats,
+            // Older saved files have no such value yet: then the default (2048) is used.
+            maxReplyTokens = (p[Keys.MAX_REPLY] ?: d.maxReplyTokens)
+                .coerceIn(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS)
         )
     }
 
@@ -115,6 +122,7 @@ class SettingsStore(context: Context) {
             p[Keys.SYSTEM_PROMPT] = s.systemPrompt
             p[Keys.STOP_SEQUENCE] = s.stopSequence
             p[Keys.AUTO_NAME] = s.autoNameChats
+            p[Keys.MAX_REPLY] = s.maxReplyTokens
         }
     }
 }

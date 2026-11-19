@@ -33,6 +33,15 @@
 //   - Saving to disk is NOT done here. SettingsViewModel does it (next
 //     files), so this screen stays simple.
 //
+// MAX REPLY LENGTH (added after Phase 3):
+//   A long answer stopped in the middle because the reply limit was fixed
+//   at 1024 tokens (and the thinking text counts too). Now the user types
+//   the limit in the Model Configuration card: "Max reply length (tokens)",
+//   from 64 to 32768, default 2048. AppSettings has a new field
+//   maxReplyTokens. The box turns red for a number outside the range and
+//   the last valid number is kept. Saving to disk is done by SettingsStore,
+//   and ChatViewModel uses the value instead of the old fixed 1024.
+//
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
 // =====================================================================
@@ -60,6 +69,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -88,6 +98,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.haven.chat.engine.EngineManager
 import kotlin.math.roundToInt
@@ -108,6 +119,13 @@ private const val MAX_STOP_CHARS = 100      // longest allowed stop sequence
 // The big ones (16384, 32768) are for phones with a lot of RAM.
 private val CONTEXT_SIZES = listOf(2048, 4096, 8192, 16384, 32768)
 
+// MAX REPLY LENGTH (tokens Gemma may write for ONE reply; thinking counts too).
+// The user types the number. The default and the allowed range live here so
+// SettingsStore and ChatViewModel use the same values.
+const val DEFAULT_MAX_REPLY_TOKENS = 2048
+const val MIN_REPLY_TOKENS = 64
+const val MAX_REPLY_TOKENS = 32768
+
 // ---------------------------------------------------------------------
 // All user settings in ONE container. "copy(...)" makes a new copy with
 // one value changed (the old one is never edited in place).
@@ -119,7 +137,8 @@ data class AppSettings(
     val modelPath: String = DEFAULT_MODEL_PATH,    // where the GGUF file is
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
     val stopSequence: String = DEFAULT_STOP_SEQUENCE,
-    val autoNameChats: Boolean = false             // PHASE 3: let Gemma title new chats (default OFF)
+    val autoNameChats: Boolean = false,            // PHASE 3: let Gemma title new chats (default OFF)
+    val maxReplyTokens: Int = DEFAULT_MAX_REPLY_TOKENS // longest reply in tokens (thinking + answer), typed by the user
 )
 
 // ---------------------------------------------------------------------
@@ -165,6 +184,11 @@ fun SettingsScreen(
 
     // A short message under the Browse button (for example "not a .gguf file").
     var browseMessage by remember { mutableStateOf("") }
+
+    // MAX REPLY LENGTH: the text exactly as the user types it. It is kept
+    // apart from the draft because "" or "5" is allowed while typing, but
+    // the draft only ever receives a VALID number.
+    var maxReplyText by remember { mutableStateOf(initial.maxReplyTokens.toString()) }
 
     // The file picker. "OpenDocument" shows Android's normal file chooser.
     // When the user picks a file, the lambda below receives its address
@@ -294,6 +318,42 @@ fun SettingsScreen(
                         label = { Text("Standard") }
                     )
                 }
+
+                // --- MAX REPLY LENGTH: the user types the number ---
+                // How many tokens Gemma may write for ONE reply. The thinking
+                // text counts too. When the limit is reached the reply simply
+                // stops (that is why a long answer can end in the middle).
+                // Only a number from MIN to MAX is accepted into the draft;
+                // otherwise the box turns red and the last valid number stays.
+                val replyNumber = maxReplyText.toIntOrNull()
+                val replyError = replyNumber == null ||
+                        replyNumber < MIN_REPLY_TOKENS || replyNumber > MAX_REPLY_TOKENS
+                OutlinedTextField(
+                    value = maxReplyText,
+                    onValueChange = { raw ->
+                        // Keep digits only, at most 5 of them.
+                        val digits = raw.filter { it.isDigit() }.take(5)
+                        maxReplyText = digits
+                        val n = digits.toIntOrNull()
+                        if (n != null && n in MIN_REPLY_TOKENS..MAX_REPLY_TOKENS) {
+                            draft = draft.copy(maxReplyTokens = n)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Max reply length (tokens)") },
+                    singleLine = true,
+                    isError = replyError,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    supportingText = {
+                        Text(
+                            if (replyError) {
+                                "Enter a number from $MIN_REPLY_TOKENS to $MAX_REPLY_TOKENS."
+                            } else {
+                                "Thinking counts too. Longer replies take longer to write."
+                            }
+                        )
+                    }
+                )
 
                 // --- PHASE 3: Auto-name chats switch ---
                 // OFF (default): a new chat gets the first words of your

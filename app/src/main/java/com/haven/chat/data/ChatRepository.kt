@@ -21,6 +21,13 @@
 //
 // USED BY (next steps): ChatViewModel (save messages, open and delete
 //       chats, set titles) and the drawer (chat list and search).
+//
+// PHASE 4 CHANGE (the only change in this file, marked "PHASE 4"):
+//   New class StoredMessage and new function loadMessagesAfter(). They give
+//   the memory extraction the messages of a chat that are newer than the
+//   chat's "last-done marker", with their REAL database ids and dates.
+//   (ChatMessage has no date, so it is not enough for the extraction.)
+//   Nothing else in this file was changed.
 // =====================================================================
 package com.haven.chat.data
 
@@ -32,6 +39,21 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.temporal.ChronoUnit
+
+// ---------------------------------------------------------------------
+// PHASE 4 (NEW): one SAVED message, as the memory extraction needs it.
+//   id         the real database id (never a temporary negative one)
+//   isUser     true = the user's message, false = Gemma's answer
+//   text       the visible text. For an answer this is the FINAL answer
+//              (the thinking text is not part of it).
+//   createdAt  when it was saved (milliseconds since 1970)
+// ---------------------------------------------------------------------
+class StoredMessage(
+    val id: Long,
+    val isUser: Boolean,
+    val text: String,
+    val createdAt: Long
+)
 
 class ChatRepository(context: Context) {
 
@@ -106,6 +128,35 @@ class ChatRepository(context: Context) {
     /** All messages of a chat, oldest first, ready for the chat screen. */
     suspend fun loadMessages(chatId: Long): List<ChatMessage> {
         return dao.getMessages(chatId).map { it.toChatMessage() }
+    }
+
+    /**
+     * PHASE 4 (NEW): the messages of a chat that are NEWER than the marker,
+     * oldest first, for the memory extraction.
+     *
+     *   afterId = the chat's "last-done marker" (the id of the last message
+     *             already checked). 0 = the chat was never read.
+     *
+     * Returns the messages (an EMPTY list means: nothing new to read), or
+     * null when the database could not be read. null is NOT the same as
+     * "nothing new": the delete-chat flow must treat null as "do not delete
+     * the chat", otherwise a read problem could lose personal things.
+     */
+    suspend fun loadMessagesAfter(chatId: Long, afterId: Long): List<StoredMessage>? {
+        return try {
+            dao.getMessagesAfter(chatId, afterId).map { row ->
+                StoredMessage(
+                    id = row.id,
+                    // Anything that is not exactly "USER" counts as an
+                    // answer (same rule as toChatMessage in ChatEntities.kt).
+                    isUser = row.role == Role.USER.name,
+                    text = row.text,
+                    createdAt = row.createdAt
+                )
+            }
+        } catch (e: SQLiteException) {
+            null
+        }
     }
 
     /**
