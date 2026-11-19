@@ -17,12 +17,22 @@
 //
 // WHAT IS SAVED: every field of AppSettings (see SettingsScreen.kt):
 //       threads, contextSize, thinkingEnabled, modelPath, systemPrompt,
-//       stopSequence, autoNameChats and maxReplyTokens (the longest reply,
-//       typed by the user; added after Phase 3).
+//       stopSequence, autoNameChats, maxReplyTokens (the longest reply,
+//       typed by the user; added after Phase 3) and memoryThinking
+//       (PHASE 4: does the memory extraction use thinking?).
 //
 // IF A VALUE IS MISSING (first start, or a new setting added later), the
 // default from AppSettings is used. So adding new settings in future
 // updates never breaks old saved data.
+//
+// PHASE 4 CHANGE (the only change in this file, marked "PHASE 4"):
+//   New saved value memoryThinking (key "memory_thinking"). It is the
+//   switch in Settings that decides whether Gemma uses thinking when it
+//   looks for the personal messages of a chat ("remember my personal
+//   things"). Thinking is more accurate but slower. Old saved files have
+//   no such key: then the default from AppSettings is used (ON).
+//   NOTE: AppSettings gets the new field memoryThinking in
+//   SettingsScreen.kt (the next file). Both files go together.
 //
 // "suspend" = a function that may wait (it reads or writes a file). It
 //       must be called from a coroutine (background-friendly code).
@@ -71,6 +81,7 @@ class SettingsStore(context: Context) {
         val STOP_SEQUENCE = stringPreferencesKey("stop_sequence")
         val AUTO_NAME = booleanPreferencesKey("auto_name_chats")
         val MAX_REPLY = intPreferencesKey("max_reply_tokens")      // longest reply (tokens)
+        val MEMORY_THINKING = booleanPreferencesKey("memory_thinking")   // PHASE 4
     }
 
     /**
@@ -104,7 +115,10 @@ class SettingsStore(context: Context) {
             autoNameChats = p[Keys.AUTO_NAME] ?: d.autoNameChats,
             // Older saved files have no such value yet: then the default (2048) is used.
             maxReplyTokens = (p[Keys.MAX_REPLY] ?: d.maxReplyTokens)
-                .coerceIn(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS)
+                .coerceIn(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS),
+            // PHASE 4: older saved files have no such value yet: then the
+            // default (thinking ON) is used.
+            memoryThinking = p[Keys.MEMORY_THINKING] ?: d.memoryThinking
         )
     }
 
@@ -123,6 +137,7 @@ class SettingsStore(context: Context) {
             p[Keys.STOP_SEQUENCE] = s.stopSequence
             p[Keys.AUTO_NAME] = s.autoNameChats
             p[Keys.MAX_REPLY] = s.maxReplyTokens
+            p[Keys.MEMORY_THINKING] = s.memoryThinking      // PHASE 4
         }
     }
 }
