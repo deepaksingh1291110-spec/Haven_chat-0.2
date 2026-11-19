@@ -32,6 +32,15 @@
 //     screen.
 //   - The SettingsViewModel is created BEFORE the ChatViewModel, so the
 //     saved settings are loaded before the chat uses them.
+//
+// PHASE 4 CHANGES (marked "PHASE 4"): REMEMBER PERSONAL THINGS.
+//   - The chat screen gets four new connections: the bookmark button
+//     (onRememberClick), the memory dialog state (memoryJob) and its two
+//     buttons (onCancelMemory, onDismissMemory). They all go straight to
+//     ChatViewModel.
+//   - Nothing else changed. While the memory job runs, EngineManager.isBusy
+//     is true (state MEMORIZING), so the drawer ignores "New chat" and
+//     chat taps and shows its "Gemma is busy" hint, as it does for naming.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -162,7 +171,8 @@ fun HavenApp(
                     onOptionsClick = { navController.navigate(ROUTE_SETTINGS) },
                     // Tap on the status chip: load the model, but ONLY when
                     // it is not loaded (or the last load failed). In the
-                    // states Loading, Ready, Thinking and Naming a tap does nothing.
+                    // states Loading, Ready, Thinking, Naming and Memorizing
+                    // a tap does nothing.
                     onStatusClick = {
                         val s = EngineManager.state
                         if (s == EngineManager.State.NOT_LOADED || s == EngineManager.State.ERROR) {
@@ -176,7 +186,14 @@ fun HavenApp(
                     // PHASE 3: the Wait / Cancel popup (Auto-name chats).
                     namingDialogVisible = chatViewModel.namingDialogVisible,
                     onWaitNaming = { chatViewModel.waitForNaming() },
-                    onCancelNaming = { chatViewModel.cancelNaming() }
+                    onCancelNaming = { chatViewModel.cancelNaming() },
+                    // PHASE 4: the bookmark button starts "remember my
+                    // personal things from this chat"; the dialog shows
+                    // its progress and result.
+                    onRememberClick = { chatViewModel.rememberPersonalThings() },
+                    memoryJob = chatViewModel.memoryJob,
+                    onCancelMemory = { chatViewModel.cancelMemoryJob() },
+                    onDismissMemory = { chatViewModel.dismissMemoryJob() }
                 )
             }
         }

@@ -1,7 +1,7 @@
 // =====================================================================
 // ChatScreen.kt  (app/src/main/java/com/haven/chat/ui/chat/)
 // WHAT: The full chat screen from your design:
-//         top bar:  [menu]   Haven Chat   [new chat]
+//         top bar:  [menu]   Haven Chat   [remember] [new chat]
 //         chip:     gemma4-e2b • Ready   (tap it to load the model)
 //         list:     message bubbles (scrolls)
 //         bottom:   message input bar
@@ -38,6 +38,18 @@
 //   Selecting text in the answer that is still being written crashed the
 //   app. Now the LAST bubble is told "selectable = false" while Gemma is
 //   busy (isGenerating). See MessageBubble.kt.
+//
+// PHASE 4 CHANGES (marked "PHASE 4"):
+//   1) REMEMBER BUTTON. A small bookmark icon in the top bar (between the
+//      title and the pencil). Tapping it calls onRememberClick, which
+//      starts "remember my personal things from this chat" (the same job
+//      as typing the phrase).
+//   2) MEMORY DIALOG. While the job runs, a dialog shows the progress
+//      ("Checked 15 of 40 of your messages. 3 saved so far.") with a
+//      progress bar and a Cancel button. It cannot be closed by tapping
+//      outside. When the job is over, the same dialog shows the short
+//      result text and an OK button. The ViewModel (ChatViewModel,
+//      memoryJob) decides what is shown; this screen only draws it.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -45,7 +57,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -59,12 +73,14 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.outlined.Bookmark
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -114,7 +130,11 @@ fun ChatScreen(
     onStop: () -> Unit = {},            // user tapped the stop button
     namingDialogVisible: Boolean = false, // PHASE 3: show the Wait / Cancel popup
     onWaitNaming: () -> Unit = {},        // PHASE 3: user chose "Wait" (or closed the popup)
-    onCancelNaming: () -> Unit = {}       // PHASE 3: user chose "Cancel"
+    onCancelNaming: () -> Unit = {},      // PHASE 3: user chose "Cancel"
+    onRememberClick: () -> Unit = {},     // PHASE 4: user tapped the bookmark icon
+    memoryJob: MemoryJobUi? = null,       // PHASE 4: what the memory dialog shows (null = no dialog)
+    onCancelMemory: () -> Unit = {},      // PHASE 4: user tapped Cancel while the job runs
+    onDismissMemory: () -> Unit = {}      // PHASE 4: user tapped OK after the job
 ) {
     // Remembers the scroll position of the message list.
     val listState = rememberLazyListState()
@@ -160,6 +180,10 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    // PHASE 4: "remember my personal things from this chat".
+                    IconButton(onClick = onRememberClick) {
+                        Icon(Icons.Outlined.Bookmark, contentDescription = "Remember personal things")
+                    }
                     IconButton(onClick = onNewChatClick) {
                         Icon(Icons.Outlined.Edit, contentDescription = "New chat")
                     }
@@ -304,5 +328,58 @@ fun ChatScreen(
                 TextButton(onClick = onCancelNaming) { Text("Cancel") }
             }
         )
+    }
+
+    // ---------- PHASE 4: MEMORY DIALOG ----------
+    // Shown for the whole memory job ("remember my personal things from
+    // this chat"). memoryJob == null means: no dialog.
+    //   RUNNING  : progress text + progress bar + [Cancel]. Tapping outside
+    //              or pressing Back does NOT close it (the job is running;
+    //              only Cancel stops it).
+    //   FINISHED : the result text + [OK]. Tapping outside counts as OK.
+    // The numbers and texts come from ChatViewModel (memoryJob).
+    if (memoryJob != null) {
+        val job = memoryJob
+        if (job.running) {
+            AlertDialog(
+                onDismissRequest = { /* not closable while the job runs */ },
+                title = { Text("Saving personal memories") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (job.total > 0) {
+                            // We know how many messages there are: show the real progress.
+                            Text(
+                                "Checked ${job.checked} of ${job.total} of your messages.\n" +
+                                        "${job.saved} saved so far."
+                            )
+                            LinearProgressIndicator(
+                                progress = { job.checked.toFloat() / job.total.toFloat() },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        } else {
+                            // The first batch is still being read: no numbers yet.
+                            Text(
+                                "Gemma is reading your messages. " +
+                                        "The first step can take a minute."
+                            )
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+                },
+                confirmButton = { /* nothing: only Cancel is offered while it runs */ },
+                dismissButton = {
+                    TextButton(onClick = onCancelMemory) { Text("Cancel") }
+                }
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = onDismissMemory,
+                title = { Text("Memories") },
+                text = { Text(job.message ?: "") },
+                confirmButton = {
+                    TextButton(onClick = onDismissMemory) { Text("OK") }
+                }
+            )
+        }
     }
 }

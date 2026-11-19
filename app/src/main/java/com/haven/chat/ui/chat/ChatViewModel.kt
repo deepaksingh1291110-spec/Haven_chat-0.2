@@ -33,13 +33,32 @@
 //   the user types in Settings (64 to 32768, default 2048). The engine still
 //   stops earlier if the context window is full.
 //
+// PHASE 4 (everything new is marked "PHASE 4"): REMEMBER PERSONAL THINGS.
+//   1) The typed phrase "remember my personal things from this chat" (and,
+//      later, a menu item that calls rememberPersonalThings()) starts the
+//      memory job INSTEAD of a normal message. The phrase is never saved
+//      as a chat message and never sent to Gemma as a question.
+//   2) The job itself is MemoryExtractor.kt: Gemma only DECIDES which of
+//      the user's messages are personal; the app copies each personal
+//      question and its saved final answer, word for word, into the
+//      memories database (a separate file, memories.db). Deleting a chat
+//      never deletes its memories.
+//   3) While the job runs, "memoryJob" holds the progress for a dialog
+//      (progress, a Cancel button, and at the end a short result text).
+//      The dialog is drawn by ChatScreen / HavenApp (next files).
+//   4) While it runs, nothing else may start (sending, opening, new chat,
+//      delete): our "working" flag AND the engine state MEMORIZING block
+//      them. At the end the open chat is put back into Gemma's head.
+//
 // STILL TEMPORARY:
-//   - No Agent and no long-term memory yet (Phase 4).
+//   - No Agent and no memory SEARCH yet (later steps of Phase 4).
+//   - Delete chat does not save personal things first yet (step 4).
 //
 // IDS: messages shown on screen need a unique id for the list. Messages
 //   loaded from the database keep their database id (positive numbers).
 //   Messages created in this session get a temporary NEGATIVE id, so the
-//   two kinds can never collide.
+//   two kinds can never collide. (The memory job reads the messages from
+//   the DATABASE, so it always sees the real, positive ids.)
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -52,9 +71,13 @@ import androidx.lifecycle.viewModelScope
 import com.haven.chat.data.ChatMessage
 import com.haven.chat.data.ChatRepository
 import com.haven.chat.data.ChatSummary
+import com.haven.chat.data.MemoryRepository
 import com.haven.chat.data.Role
 import com.haven.chat.engine.EngineManager
+import com.haven.chat.engine.MemoryExtractor
+import com.haven.chat.engine.MemoryJobResult
 import com.haven.chat.ui.settings.SettingsViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -63,10 +86,32 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+// ---------------------------------------------------------------------
+// PHASE 4 (NEW): what the memory dialog shows.
+//   running  true = Gemma is working (show progress and a Cancel button)
+//            false = the job is over (show "message" and an OK button)
+//   checked / total  how many of the user's messages are checked so far,
+//            out of how many. total = 0 means "not known yet" (the first
+//            batch is still being read).
+//   saved    how many memories were saved so far
+//   message  the result text, only when running = false
+// ---------------------------------------------------------------------
+class MemoryJobUi(
+    val running: Boolean,
+    val checked: Int = 0,
+    val total: Int = 0,
+    val saved: Int = 0,
+    val message: String? = null
+)
+
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // PHASE 3: the one place that saves and loads chats.
     private val repo = ChatRepository(application)
+
+    // PHASE 4: the job that finds the personal messages of a chat and
+    // saves them (it uses the chat repository and the memory repository).
+    private val extractor = MemoryExtractor(repo, MemoryRepository(application))
 
     // ----- STATE (data the screen shows) -----
     // "mutableStateOf" = when this value changes, Compose redraws.
@@ -86,6 +131,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // appears when the user sends a message while Gemma is still naming
     // the chat. ChatScreen / HavenApp draw the popup (next steps).
     var namingDialogVisible by mutableStateOf(false)
+        private set
+
+    // PHASE 4: the state of the memory dialog. null = no dialog is shown.
+    // ChatScreen / HavenApp draw it (next files).
+    var memoryJob by mutableStateOf<MemoryJobUi?>(null)
         private set
 
     // Text of the chip under the title, for example "gemma4-e2b-q4_0 • Ready".
@@ -131,8 +181,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val localOnlyIds = HashSet<Long>()
 
     // True while we are busy with something the engine state does not show:
-    // saving a message, opening a chat, deleting a chat. It stops a second
-    // send/open/delete from starting in the middle of the first one.
+    // saving a message, opening a chat, deleting a chat (PHASE 4: and the
+    // memory job). It stops a second send/open/delete from starting in the
+    // middle of the first one.
     private var working = false
 
     // A message the user sent while Gemma was naming the chat. It is sent
@@ -156,8 +207,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Called when the user taps send.
     fun sendMessage(text: String) {
         val clean = text.trim()
-        // Ignore empty text, or if we are still busy with something.
-        if (clean.isEmpty() || working) return
+        if (clean.isEmpty()) return
+
+        // PHASE 4: the typed phrase starts the memory job. It is NOT a
+        // chat message: it is not shown, not saved and not sent to Gemma.
+        if (isMemoryCommand(clean)) {
+            rememberPersonalThings()
+            return
+        }
+
+        // Ignore the message if we are still busy with something.
+        if (working) return
 
         // PHASE 3: Gemma is writing a chat title right now. Keep the text,
         // show the "Wait / Cancel" popup, and send it when naming is over.
@@ -167,8 +227,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // Gemma is writing an answer, or the model is loading: ignore.
-        if (isGenerating || EngineManager.state == EngineManager.State.LOADING) return
+        // Gemma is writing an answer, or the model is loading (PHASE 4: or
+        // Gemma is saving memories): ignore.
+        if (isGenerating ||
+            EngineManager.state == EngineManager.State.LOADING ||
+            EngineManager.state == EngineManager.State.MEMORIZING
+        ) return
 
         working = true
 
@@ -408,6 +472,86 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ----- PHASE 4: REMEMBER PERSONAL THINGS -----
+
+    // PHASE 4: starts the memory job for the OPEN chat. Called by the typed
+    // phrase (see sendMessage) and, in the next files, by a menu item.
+    // Whatever happens, the user gets a dialog (progress, or a short text).
+    fun rememberPersonalThings() {
+        // The dialog is already open (a job is running or its result is
+        // still shown): do nothing.
+        if (memoryJob != null) return
+
+        // Busy with a send, an open or a delete, or the engine is busy.
+        // (This also covers the short moment after an answer, while it is
+        // still being saved: then the answer would be missing.)
+        if (working || EngineManager.isBusy) {
+            memoryJob = MemoryJobUi(
+                running = false,
+                message = "Gemma is busy. Try again in a moment."
+            )
+            return
+        }
+
+        // A new chat with no message yet is not in the database.
+        val chatId = currentChatId
+        if (chatId == null) {
+            memoryJob = MemoryJobUi(
+                running = false,
+                message = "This chat has no messages yet, so there is nothing to remember."
+            )
+            return
+        }
+
+        working = true
+        memoryJob = MemoryJobUi(running = true)
+        val s = SettingsViewModel.active
+
+        viewModelScope.launch {
+            val ui: MemoryJobUi = try {
+                val result = extractor.run(
+                    chatId = chatId,
+                    memoryThinking = s.memoryThinking,
+                    systemPrompt = SettingsViewModel.systemPromptOf(s),
+                    chatThinking = s.thinkingEnabled,
+                    // Called at the END of the job, on the main thread: the
+                    // open chat is put back into Gemma's head.
+                    restoreHistory = { historyForEngine(messages) },
+                    onProgress = { p ->
+                        memoryJob = MemoryJobUi(
+                            running = true,
+                            checked = p.checked,
+                            total = p.total,
+                            saved = p.saved
+                        )
+                    }
+                )
+                MemoryJobUi(running = false, saved = result.saved, message = memoryMessage(result))
+            } catch (e: CancellationException) {
+                throw e      // the ViewModel is being destroyed: let it stop
+            } catch (e: Exception) {
+                MemoryJobUi(
+                    running = false,
+                    message = "Something went wrong: " + (e.message ?: e.javaClass.simpleName)
+                )
+            } finally {
+                working = false
+            }
+            memoryJob = ui
+        }
+    }
+
+    // PHASE 4: the dialog's Cancel button. The batch that Gemma is reading
+    // is interrupted; what earlier batches saved stays saved.
+    fun cancelMemoryJob() {
+        extractor.cancel()
+    }
+
+    // PHASE 4: the dialog's OK button (only works when the job is over).
+    fun dismissMemoryJob() {
+        if (memoryJob?.running != true) memoryJob = null
+    }
+
     // Stop writing if this screen is destroyed for good.
     override fun onCleared() {
         EngineManager.historyProvider = null
@@ -438,5 +582,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // It builds a NEW list, so Compose redraws.
     private fun updateMessage(id: Long, change: (ChatMessage) -> ChatMessage) {
         messages = messages.map { if (it.id == id) change(it) else it }
+    }
+
+    // PHASE 4: is this text the memory command? Capitals, extra spaces and
+    // a final "." "!" or "?" do not matter.
+    private fun isMemoryCommand(text: String): Boolean {
+        val t = text.trim().lowercase()
+            .trimEnd('.', '!', '?', ' ')
+            .replace(Regex("\\s+"), " ")
+        return t == MEMORY_COMMAND
+    }
+
+    // PHASE 4: "3 memories", "1 memory".
+    private fun memoriesText(n: Int): String = if (n == 1) "1 memory" else "$n memories"
+
+    // PHASE 4: the short result text for the dialog.
+    private fun memoryMessage(r: MemoryJobResult): String = when {
+        r.error != null ->
+            "Could not finish: " + r.error +
+                    (if (r.saved > 0) "\n" + memoriesText(r.saved) + " saved before the problem." else "")
+        r.cancelled ->
+            if (r.saved > 0) "Cancelled. " + memoriesText(r.saved) + " saved before you cancelled."
+            else "Cancelled. Nothing was saved."
+        r.saved == 0 ->
+            "Done. No new personal things were found in this chat."
+        else ->
+            "Done. " + memoriesText(r.saved) + " saved from this chat."
+    }
+
+    companion object {
+        // PHASE 4: the typed phrase that starts the memory job.
+        const val MEMORY_COMMAND = "remember my personal things from this chat"
     }
 }

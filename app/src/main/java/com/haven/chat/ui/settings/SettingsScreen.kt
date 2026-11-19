@@ -3,7 +3,7 @@
 // WHAT: The settings screen from your design:
 //         top bar:  [back]  Settings            [Save & Reload]
 //         card:     Model Configuration (threads, context, thinking,
-//                   auto-name chats)
+//                   auto-name chats, memory thinking)
 //         field:    model file path + Browse button
 //         card:     Storage Status (file access allowed or not)
 //         button:   Load Model
@@ -41,6 +41,18 @@
 //   maxReplyTokens. The box turns red for a number outside the range and
 //   the last valid number is kept. Saving to disk is done by SettingsStore,
 //   and ChatViewModel uses the value instead of the old fixed 1024.
+//
+// PHASE 4 CHANGES (marked "PHASE 4"):
+//   - New setting "Memory thinking" (default ON): a switch in the Model
+//     Configuration card. AppSettings has a new field memoryThinking. It
+//     decides whether Gemma uses thinking when it looks for the PERSONAL
+//     messages of a chat ("remember my personal things from this chat" and
+//     the delete-chat step). Thinking found every personal message in the
+//     user's tests but is slower; OFF is faster but missed some.
+//     It is separate from the "Reasoning" chips above, which are only for
+//     normal chat. Saving to disk is done by SettingsStore.
+//   - The Load Model button is also switched off while Gemma is saving
+//     memories (the engine is busy then), and says "Saving memories...".
 //
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
@@ -138,7 +150,8 @@ data class AppSettings(
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
     val stopSequence: String = DEFAULT_STOP_SEQUENCE,
     val autoNameChats: Boolean = false,            // PHASE 3: let Gemma title new chats (default OFF)
-    val maxReplyTokens: Int = DEFAULT_MAX_REPLY_TOKENS // longest reply in tokens (thinking + answer), typed by the user
+    val maxReplyTokens: Int = DEFAULT_MAX_REPLY_TOKENS, // longest reply in tokens (thinking + answer), typed by the user
+    val memoryThinking: Boolean = true             // PHASE 4: use thinking when Gemma looks for personal messages (default ON)
 )
 
 // ---------------------------------------------------------------------
@@ -379,6 +392,33 @@ fun SettingsScreen(
                         onCheckedChange = { draft = draft.copy(autoNameChats = it) }
                     )
                 }
+
+                // --- PHASE 4: Memory thinking switch ---
+                // ON (default): when Gemma looks for the PERSONAL messages of
+                // a chat, it thinks first. In the user's tests this found
+                // every personal message, but it takes longer.
+                // OFF: faster, but it can miss a personal message that is
+                // mixed with a general question.
+                // Only the memory job reads this setting, not normal chat.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Memory thinking", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = "Gemma thinks when it looks for your personal messages. " +
+                                    "More accurate, but slower.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = draft.memoryThinking,
+                        onCheckedChange = { draft = draft.copy(memoryThinking = it) }
+                    )
+                }
             }
 
             // ================= MODEL FILE PATH =================
@@ -439,13 +479,15 @@ fun SettingsScreen(
 
             // ================= LOAD MODEL BUTTON =================
             // The button text follows the real engine status.
-            // It is switched off while loading, while Gemma is answering
-            // and (PHASE 3) while Gemma is naming a chat.
+            // It is switched off while loading, while Gemma is answering,
+            // while Gemma is naming a chat (PHASE 3) and while Gemma is
+            // saving memories (PHASE 4).
             Button(
                 onClick = { onLoadModel(draft) },
                 enabled = engineState != EngineManager.State.LOADING &&
                           engineState != EngineManager.State.THINKING &&
-                          engineState != EngineManager.State.NAMING,
+                          engineState != EngineManager.State.NAMING &&
+                          engineState != EngineManager.State.MEMORIZING,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp)
@@ -464,6 +506,7 @@ fun SettingsScreen(
                         EngineManager.State.READY -> "Model loaded (tap to reload)"
                         EngineManager.State.THINKING -> "Gemma is answering..."
                         EngineManager.State.NAMING -> "Naming chat..."
+                        EngineManager.State.MEMORIZING -> "Saving memories..."
                         else -> "Load Model"
                     },
                     style = MaterialTheme.typography.labelLarge
