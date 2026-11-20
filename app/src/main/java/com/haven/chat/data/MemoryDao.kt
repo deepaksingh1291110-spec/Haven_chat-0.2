@@ -5,7 +5,9 @@
 //         - give me the saved memories (and keep telling me when they change),
 //         - add memories, edit one, delete one, delete all,
 //         - read / move / remove the "last-done marker" of a chat,
-//         - save a batch of new memories AND the marker together.
+//         - save a batch of new memories AND the marker together,
+//         - (step 6) give me ALL memories once, and how many there are,
+//           for the keyword search that Gemma can use.
 // HOW:  Same as ChatDao.kt: we write the SQL line (@Query) or the label
 //       (@Insert) and Room writes the real code at build time (KSP). The
 //       SQL is CHECKED during the build: a typo in a column name is a
@@ -14,8 +16,8 @@
 // FLOW vs SUSPEND (same rule as ChatDao.kt):
 //   - "Flow" function (observeMemories): a LIVE stream. The first list
 //     arrives at once and a NEW list arrives by itself after every change.
-//     The "Privacy & local data" screen will use it, so the list updates
-//     by itself after an edit or delete.
+//     The "Privacy & local data" screen uses it, so the list updates by
+//     itself after an edit or delete.
 //   - "suspend" functions: do one job in the background and give back the
 //     result. They must be called from a coroutine.
 //
@@ -34,8 +36,11 @@
 //     deleted is NOT made again from the same chat.
 //   - "Delete all" also keeps the markers, for the same reason.
 //
-// NOT HERE YET: the keyword search for Gemma (light search). It is added
-//   in step 6 of the plan.
+// PHASE 4, STEP 6 (the only change in this file, marked "STEP 6"):
+//   getAllMemories() and getCount(). The keyword search itself is NOT SQL:
+//   Gemma's keywords are different every time, and there are only a few
+//   hundred or thousand short memories, so MemorySearch.kt (a plain Kotlin
+//   file) scores them in memory. The DAO only has to hand over the rows.
 //
 // USED BY: MemoryDatabase.kt (creates it), MemoryRepository.kt (calls it)
 // =====================================================================
@@ -63,6 +68,17 @@ abstract class MemoryDao {
     // How many memories there are (live). For a counter on the Privacy screen.
     @Query("SELECT COUNT(*) FROM memories")
     abstract fun observeCount(): Flow<Int>
+
+    // STEP 6 (NEW): ALL memories, ONCE (not live), newest first. The keyword
+    // search reads this list and scores it in memory (see MemorySearch.kt).
+    @Query("SELECT * FROM memories ORDER BY createdAt DESC, id DESC")
+    abstract suspend fun getAllMemories(): List<MemoryEntity>
+
+    // STEP 6 (NEW): how many memories there are, ONCE (not live). The chat
+    // uses it to decide whether Gemma gets the search tool at all (with no
+    // memories there is nothing to search).
+    @Query("SELECT COUNT(*) FROM memories")
+    abstract suspend fun getCount(): Int
 
     // -----------------------------------------------------------------
     // ONE MEMORY

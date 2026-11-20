@@ -12,6 +12,8 @@
 //     chat's "last-done marker" in the same database step  (extraction)
 //   - lastMemorizedMessageId(): where the extraction must continue
 //   - removeMarker(): called when a chat is deleted
+//   - (step 6) allMemories() and count(): what the keyword search for
+//     Gemma needs
 //
 // WHY A SEPARATE CLASS: if the database changes later (for example vectors
 //   for heavy search), only this file has to change, not every screen.
@@ -25,8 +27,13 @@
 //   messages are personal is decided elsewhere (later steps); this class
 //   just receives the final pairs and saves them word for word.
 //
-// USED BY (next steps): the extraction code (saveBatch, markers), the
-//   delete-chat flow (removeMarker) and the Privacy & local data screen.
+// PHASE 4, STEP 6 (the only change in this file, marked "STEP 6"):
+//   allMemories() and count(). They never throw: a database problem gives
+//   null (allMemories) or 0 (count), so a problem in the memory search can
+//   never crash a chat answer.
+//
+// USED BY: the extraction code (saveBatch, markers), the delete-chat flow
+//   (removeMarker), the Privacy & local data screen, and the memory search.
 // =====================================================================
 package com.haven.chat.data
 
@@ -73,6 +80,36 @@ class MemoryRepository(context: Context) {
 
     /** How many memories are saved, as a LIVE number. */
     fun observeCount(): Flow<Int> = dao.observeCount()
+
+    // -----------------------------------------------------------------
+    // STEP 6: for the keyword search (read once, not live)
+    // -----------------------------------------------------------------
+
+    /**
+     * ALL memories, once, newest first. The keyword search (MemorySearch.kt)
+     * scores them in memory. Returns null when the database could not be
+     * read (then the search tells Gemma it could not look). Never throws.
+     */
+    suspend fun allMemories(): List<MemoryEntity>? {
+        return try {
+            dao.getAllMemories()
+        } catch (e: SQLiteException) {
+            null
+        }
+    }
+
+    /**
+     * How many memories are saved, once. 0 also when the database could not
+     * be read: then Gemma simply gets no search tool for that answer.
+     * Never throws.
+     */
+    suspend fun count(): Int {
+        return try {
+            dao.getCount()
+        } catch (e: SQLiteException) {
+            0
+        }
+    }
 
     // -----------------------------------------------------------------
     // EDIT / DELETE (Privacy & local data screen)

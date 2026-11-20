@@ -19,8 +19,6 @@
 // STATUS: "state" is Compose state. When it changes, any screen that
 //       reads it redraws by itself (the chip under the chat title).
 //
-// NOT USED HERE (on purpose): Agent, tools, memory SEARCH (later steps).
-//
 // ---------------------------------------------------------------------
 // PHASE 3 CHANGES (everything new is marked "PHASE 3"):
 //   1) New state NAMING: Gemma is writing a chat title in the background.
@@ -36,7 +34,7 @@
 //      the real chat.
 //   5) contextSize is remembered after loading.
 //
-// PHASE 4 CHANGES (everything new is marked "PHASE 4"):
+// PHASE 4, STEP 3 CHANGES (marked "PHASE 4"):
 //   The job "find the PERSONAL messages of a chat" (memory extraction).
 //   1) New state MEMORIZING: Gemma is classifying messages. It is a BUSY
 //      state like NAMING (isBusy covers it, the chip says "Saving
@@ -53,6 +51,30 @@
 //   4) finishMemorizing(): puts the open chat back into Gemma's head
 //      (like after a title) and sets the state back to READY.
 //   5) cancelMemorizing(): stops the running batch (same as stop()).
+//
+// PHASE 4, STEP 6 CHANGES (marked "STEP 6"): LIGHT SEARCH (a TOOL for Gemma).
+//   generate() can now give Gemma ONE tool (a ToolRunner, here: the memory
+//   search_memory tool, see MemorySearch.kt). How a normal answer goes:
+//     1) The tool is registered, Gemma reads the question and writes the
+//        answer. Nothing else happens. (Most answers.)
+//     2) Or Gemma decides it needs the tool and, instead of an answer, asks
+//        for a CALL with arguments. Then the engine:
+//          - tells the screen to start the bubble again (onRestart), because
+//            what was streamed so far was only the lead-in to the call,
+//          - runs the tool (tool.run, still on the worker thread) and gives
+//            the result text back to Gemma (addToolResult),
+//          - asks Gemma to continue (generate with an empty text). Gemma
+//            now reads the result and writes the real answer.
+//        Gemma may ask for the tool a second time (to narrow the search).
+//        At most MAX_TOOL_ROUNDS calls are served per answer; if Gemma still
+//        asks after that, the answer ends with a plain-words problem text.
+//   - The tool is registered ONLY for this call and removed afterwards
+//     (also after errors), so the other jobs (title, memory extraction)
+//     never see it.
+//   - searchingMemory (Compose state) is true while the tool runs; the chip
+//     then says "Searching memories...".
+//   - generate() has two new parameters with default values, so older
+//     calls still work: tool (null = no tool) and onRestart.
 //   Everything else works as before.
 // =====================================================================
 package com.haven.chat.engine
@@ -109,13 +131,19 @@ object EngineManager {
     var thinkingSeen by mutableStateOf(false)
         private set
 
+    // STEP 6: true while the memory search tool is running (between Gemma's
+    // call and the result going back). The chip then says "Searching memories...".
+    var searchingMemory by mutableStateOf(false)
+        private set
+
     /** Short text for the status chip, for example "Ready" or "Loading...". */
     fun statusText(): String = when (state) {
         State.NOT_LOADED -> "Not loaded"
         State.LOADING -> "Loading..."
         State.READY -> "Ready"
         State.THINKING ->
-            if (answering) "Writing..."
+            if (searchingMemory) "Searching memories..."     // STEP 6
+            else if (answering) "Writing..."
             else if (thinkingSeen) "Thinking..."
             else "Reading..."
         State.NAMING -> "Naming chat..."      // PHASE 3
@@ -183,6 +211,29 @@ object EngineManager {
     )
 
     // -----------------------------------------------------------------
+    // STEP 6: a tool that Gemma may call during generate()
+    // -----------------------------------------------------------------
+    /**
+     * name, description, parametersJson  what Gemma reads about the tool
+     *     (the parameters are a JSON schema). For the memory search see
+     *     MemorySearch.kt.
+     * run  does the work when Gemma calls the tool. It is called ON THE
+     *     WORKER THREAD (so it may block for a moment, but must not touch
+     *     the screen). It gets:
+     *       argsJson     the arguments of the call, as JSON text
+     *       tokenBudget  how many tokens the result text may use
+     *       countTokens  counts the tokens of a text exactly (Gemma's tokenizer)
+     *     and returns the result text that Gemma reads. It should never
+     *     throw; if it does, Gemma is told that the tool failed.
+     */
+    class ToolRunner(
+        val name: String,
+        val description: String,
+        val parametersJson: String,
+        val run: (argsJson: String, tokenBudget: Int, countTokens: (String) -> Int) -> String
+    )
+
+    // -----------------------------------------------------------------
     // PHASE 3: numbers used when an old chat is put back into Gemma
     // -----------------------------------------------------------------
 
@@ -208,6 +259,10 @@ object EngineManager {
     // PHASE 4: how many times one batch is tried when Gemma's reply cannot
     // be understood (1 first try + 1 more try).
     private const val MEMORY_ATTEMPTS = 2
+
+    // STEP 6: how many tool calls are served for ONE answer. (Gemma asks, we
+    // answer: that is one round. A second round lets Gemma narrow its search.)
+    private const val MAX_TOOL_ROUNDS = 2
 
     // -----------------------------------------------------------------
     // Private parts
@@ -243,6 +298,7 @@ object EngineManager {
         onMain {
             state = newState
             errorMessage = message
+            searchingMemory = false          // STEP 6: a new state ends any search
             // Any state other than THINKING means the busy phases are over.
             if (newState != State.THINKING) {
                 answering = false
@@ -474,6 +530,15 @@ object EngineManager {
     /**
      * onThinking / onAnswer get small pieces of text while Gemma writes
      * (on the main thread). onDone runs once at the end with the full Result.
+     *
+     * STEP 6 (both new parameters have default values):
+     *   tool       a tool Gemma may call during this answer (the memory
+     *              search), or null for none. See the notes at the top.
+     *   onRestart  called (main thread) when Gemma has asked for the tool
+     *              and the answer starts again after the tool result. The
+     *              caller should throw away the thinking and answer pieces
+     *              it collected so far: they were only the lead-in to the
+     *              call. The final texts come in the Result.
      */
     fun generate(
         userText: String,
@@ -481,7 +546,9 @@ object EngineManager {
         thinking: Boolean,
         onThinking: (String) -> Unit,
         onAnswer: (String) -> Unit,
-        onDone: (Result) -> Unit
+        onDone: (Result) -> Unit,
+        tool: ToolRunner? = null,
+        onRestart: () -> Unit = {}
     ) {
         if (state != State.READY) {
             val msg = when (state) {
@@ -528,12 +595,75 @@ object EngineManager {
             }
 
             val result: Result = try {
-                val stats = b.generate(userText.toByteArray(Charsets.UTF_8), maxNewTokens, thinking, listener)
+                // STEP 6: the tool is registered only for this answer. First
+                // remove anything left over (the tool list is global in C++).
+                b.clearTools()
+                if (tool != null) {
+                    b.addTool(
+                        tool.name,
+                        tool.description.toByteArray(Charsets.UTF_8),
+                        tool.parametersJson.toByteArray(Charsets.UTF_8)
+                    )
+                }
+
+                var stats = b.generate(userText.toByteArray(Charsets.UTF_8), maxNewTokens, thinking, listener)
+
+                // STEP 6: the tool loop. As long as Gemma ends its turn with a
+                // CALL (and not with an answer), run the tool, give Gemma the
+                // result and let it continue.
+                var rounds = 0
+                var gaveUp = false
+                while (true) {
+                    if (tool == null || stopRequested ||
+                        stats.startsWith("ERROR") || stats.startsWith("STOPPED")
+                    ) break
+
+                    val calls = b.lastToolCalls()
+                    if (calls.isEmpty()) break          // a normal answer: done
+
+                    if (rounds >= MAX_TOOL_ROUNDS) {    // Gemma keeps asking: give up
+                        gaveUp = true
+                        break
+                    }
+                    rounds++
+
+                    // The pieces streamed so far were only the lead-in to the
+                    // call. Tell the screen to start the bubble again, and show
+                    // "Searching memories..." while the tool runs.
+                    onMain {
+                        answering = false
+                        thinkingSeen = false
+                        searchingMemory = true
+                        onRestart()
+                    }
+
+                    val budget = MemorySearch.tokenBudget(loadedContext)
+                    for (call in calls) {
+                        val text = try {
+                            tool.run(call.argumentsJson, budget) { t -> tokensOf(b, t) }
+                        } catch (t: Throwable) {
+                            "The search failed. Tell the user you could not look."
+                        }
+                        b.addToolResult(call.id, call.name, text.toByteArray(Charsets.UTF_8))
+                    }
+
+                    onMain { searchingMemory = false }
+
+                    // An EMPTY text: nothing new is added, Gemma reads the tool
+                    // result and continues.
+                    stats = b.generate(ByteArray(0), maxNewTokens, thinking, listener)
+                }
+
                 when {
                     stats.startsWith("ERROR") ->
                         Result("", "", null, null, false, stats.removePrefix("ERROR:").trim())
                     stats.startsWith("STOPPED") ->
                         Result("", "", null, null, true, null)
+                    gaveUp ->
+                        Result(
+                            "", "", null, null, false,
+                            "Gemma kept searching your memories without giving an answer. Try asking again."
+                        )
                     else -> {
                         // stats looks like:
                         // "prompt 20 new tokens (0 reused) 15.2 t/s | answer 85 tokens 7.4 t/s"
@@ -550,6 +680,13 @@ object EngineManager {
                 }
             } catch (t: Throwable) {
                 Result("", "", null, null, false, "Generation failed: " + (t.message ?: t.javaClass.simpleName))
+            }
+
+            // STEP 6: take the tool away again, so the other jobs never see it.
+            try {
+                b.clearTools()
+            } catch (t: Throwable) {
+                // nothing to do
             }
 
             setState(State.READY)

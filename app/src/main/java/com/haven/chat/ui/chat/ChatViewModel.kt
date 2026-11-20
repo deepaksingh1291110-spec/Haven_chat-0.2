@@ -65,8 +65,26 @@
 //   Memories that were saved stay, always.
 //   The progress / result dialog is the same one as for "remember" (memoryJob).
 //
+// PHASE 4, STEP 6 (marked "STEP 6"): LIGHT SEARCH FOR GEMMA.
+//   When the user sends a message, Gemma may get ONE tool: search_memory
+//   (see MemorySearch.kt). It is given only when
+//     - the setting "Memory search" is ON, and
+//     - there is at least one saved memory (otherwise there is nothing to
+//       search, and the prompt stays as short as before).
+//   If Gemma calls the tool, EngineManager runs it (the keyword match runs
+//   on the engine's worker thread, MemorySearch does the work) and Gemma
+//   writes the answer from the result. While that happens the bubble is
+//   started again (onRestart): what was streamed before the call was only
+//   the lead-in, so the collected thinking and answer pieces are thrown
+//   away. The final answer is saved like any other answer.
+//   (A question that is answered with the help of memories can itself be
+//   picked up later by "remember my personal things", as a question about
+//   the user's own life. That is fine: the user can delete it on the
+//   Privacy & local data screen.)
+//
 // STILL TEMPORARY:
-//   - No Agent and no memory SEARCH yet (later steps of Phase 4).
+//   - No heavy search (embedder + reranker): only built if light search
+//     turns out not to be enough.
 //
 // IDS: messages shown on screen need a unique id for the list. Messages
 //   loaded from the database keep their database id (positive numbers).
@@ -90,6 +108,7 @@ import com.haven.chat.data.Role
 import com.haven.chat.engine.EngineManager
 import com.haven.chat.engine.MemoryExtractor
 import com.haven.chat.engine.MemoryJobResult
+import com.haven.chat.engine.MemorySearch
 import com.haven.chat.ui.settings.SettingsViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -99,6 +118,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 // ---------------------------------------------------------------------
 // PHASE 4 (NEW): what the memory dialog shows.
@@ -280,22 +300,50 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Save the user's message (also moves the chat to the top).
             repo.addMessage(chatId, userMessage)
 
+            // STEP 6: does Gemma get the memory search tool for this answer?
+            // Only when the setting is ON and there is something to search.
+            val tool: EngineManager.ToolRunner? =
+                if (SettingsViewModel.active.memorySearch && memoryRepo.count() > 0) {
+                    memorySearchTool()
+                } else {
+                    null
+                }
+
             // Ask the real engine.
             startGeneration(
                 chatId = chatId,
                 answerId = answerId,
                 userText = clean,
-                isFirstExchange = isNewChat
+                isFirstExchange = isNewChat,
+                tool = tool
             )
         }
     }
+
+    // STEP 6: the memory search tool, ready to be handed to the engine.
+    // MemorySearch.kt holds what Gemma reads (name, description, parameters)
+    // and does the matching. This function only connects it to the database.
+    private fun memorySearchTool(): EngineManager.ToolRunner = EngineManager.ToolRunner(
+        name = MemorySearch.TOOL_NAME,
+        description = MemorySearch.TOOL_DESCRIPTION,
+        parametersJson = MemorySearch.TOOL_PARAMETERS_JSON,
+        // Called by the engine when Gemma calls the tool. It runs on the
+        // engine's WORKER thread (never the main thread), so waiting for the
+        // database here is fine. allMemories() gives null if the database
+        // could not be read; MemorySearch then tells Gemma it could not look.
+        run = { argsJson, tokenBudget, countTokens ->
+            val all = runBlocking { memoryRepo.allMemories() }
+            MemorySearch.run(all, argsJson, tokenBudget, countTokens)
+        }
+    )
 
     // Asks Gemma and streams the answer into the bubble "answerId".
     private fun startGeneration(
         chatId: Long,
         answerId: Long,
         userText: String,
-        isFirstExchange: Boolean
+        isFirstExchange: Boolean,
+        tool: EngineManager.ToolRunner?          // STEP 6: the memory search tool, or null
     ) {
         // Collect the pieces that arrive while Gemma writes.
         val answerSoFar = StringBuilder()
@@ -306,7 +354,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val thinkingOn = SettingsViewModel.active.thinkingEnabled
         val maxReply = SettingsViewModel.active.maxReplyTokens
 
-        // All three callbacks run on the main thread, so changing
+        // All callbacks run on the main thread, so changing
         // "messages" here is safe.
         EngineManager.generate(
             userText = userText,
@@ -359,6 +407,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     cleanFinish = !failed && !result.stopped,
                     isFirstExchange = isFirstExchange
                 )
+            },
+
+            // STEP 6: the memory search tool (or null).
+            tool = tool,
+
+            // STEP 6: Gemma asked for the tool, so everything streamed so far
+            // was only the lead-in to the call. Start the bubble again: throw
+            // the collected pieces away and empty the bubble. (The final
+            // texts come in "result" at the end.)
+            onRestart = {
+                answerSoFar.clear()
+                thinkingSoFar.clear()
+                updateMessage(answerId) { it.copy(text = "", thinking = null) }
             }
         )
     }

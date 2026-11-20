@@ -35,6 +35,7 @@
  *    - \sqrt{x}          -> √x   (or √(x + 1) when it is longer)
  *    - \hat{x} \bar{x}   -> x with an accent mark (single characters)
  *    - \begin{pmatrix}.. -> simple: brackets, rows on separate lines
+ *    - \begin{array}{cc} -> same, the column code {cc} is skipped (not printed)
  *  Anything it does not know is shown as plain readable text (the backslash
  *  is dropped), so a formula never turns into garbage or a crash.
  *
@@ -322,6 +323,10 @@ private val ENV_CLOSE = mapOf(
     "pmatrix" to ")", "bmatrix" to "]", "Bmatrix" to "}", "vmatrix" to "|",
     "Vmatrix" to "‖", "cases" to ""
 )
+
+// Environments that are followed by a COLUMN CODE like {cc} or {|l|r|}.
+// The code describes the columns, it is not content, so beginEnvironment skips it.
+private val ENV_WITH_ARGUMENT = setOf("array", "tabular", "tabular*", "longtable")
 
 // Spaces (Unicode space characters of different widths).
 private const val THIN_SPACE = "\u2009"       // around + - × ...
@@ -780,6 +785,20 @@ private class MathParser(
     /** \begin{pmatrix} ... : we write the brackets; rows are lines, columns are gaps. */
     private fun beginEnvironment() {
         val env = readArgSource()
+
+        // \begin{array}{cc} ... : the {cc} that follows is the COLUMN CODE
+        // (how to align each column), not content. Skip it, together with an
+        // optional position like [t], so it is not printed as stray text.
+        if (env in ENV_WITH_ARGUMENT) {
+            skipSpaces()
+            if (pos < len && src[pos] == '[') {
+                val close = src.indexOf(']', pos)
+                if (close > pos) pos = close + 1
+            }
+            skipSpaces()
+            if (pos < len && src[pos] == '{') readBraceContent()
+        }
+
         out.append(ENV_OPEN[env] ?: "")
         envStack.add(ENV_CLOSE[env] ?: "")
         prevOperand = false

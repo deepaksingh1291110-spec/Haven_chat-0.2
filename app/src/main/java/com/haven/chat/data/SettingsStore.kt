@@ -18,21 +18,26 @@
 // WHAT IS SAVED: every field of AppSettings (see SettingsScreen.kt):
 //       threads, contextSize, thinkingEnabled, modelPath, systemPrompt,
 //       stopSequence, autoNameChats, maxReplyTokens (the longest reply,
-//       typed by the user; added after Phase 3) and memoryThinking
-//       (PHASE 4: does the memory extraction use thinking?).
+//       typed by the user; added after Phase 3), memoryThinking
+//       (PHASE 4: does the memory extraction use thinking?) and
+//       memorySearch (STEP 6: may Gemma search the saved memories?).
 //
 // IF A VALUE IS MISSING (first start, or a new setting added later), the
 // default from AppSettings is used. So adding new settings in future
 // updates never breaks old saved data.
 //
-// PHASE 4 CHANGE (the only change in this file, marked "PHASE 4"):
-//   New saved value memoryThinking (key "memory_thinking"). It is the
-//   switch in Settings that decides whether Gemma uses thinking when it
-//   looks for the personal messages of a chat ("remember my personal
-//   things"). Thinking is more accurate but slower. Old saved files have
-//   no such key: then the default from AppSettings is used (ON).
-//   NOTE: AppSettings gets the new field memoryThinking in
-//   SettingsScreen.kt (the next file). Both files go together.
+// PHASE 4 CHANGES (marked "PHASE 4" and "STEP 6"):
+//   - memoryThinking (key "memory_thinking"): the switch in Settings that
+//     decides whether Gemma uses thinking when it looks for the personal
+//     messages of a chat ("remember my personal things"). Thinking is more
+//     accurate but slower. Default ON.
+//   - memorySearch (key "memory_search"): the switch in Settings that
+//     decides whether Gemma gets the search_memory tool in a chat, so it
+//     can look up the saved memories when the user asks about their own
+//     past. Default ON.
+//   Old saved files have none of these keys: the defaults are used.
+//   NOTE: AppSettings gets the field memorySearch in SettingsScreen.kt (the
+//   next file). Both files go together.
 //
 // "suspend" = a function that may wait (it reads or writes a file). It
 //       must be called from a coroutine (background-friendly code).
@@ -82,6 +87,7 @@ class SettingsStore(context: Context) {
         val AUTO_NAME = booleanPreferencesKey("auto_name_chats")
         val MAX_REPLY = intPreferencesKey("max_reply_tokens")      // longest reply (tokens)
         val MEMORY_THINKING = booleanPreferencesKey("memory_thinking")   // PHASE 4
+        val MEMORY_SEARCH = booleanPreferencesKey("memory_search")       // STEP 6
     }
 
     /**
@@ -118,7 +124,10 @@ class SettingsStore(context: Context) {
                 .coerceIn(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS),
             // PHASE 4: older saved files have no such value yet: then the
             // default (thinking ON) is used.
-            memoryThinking = p[Keys.MEMORY_THINKING] ?: d.memoryThinking
+            memoryThinking = p[Keys.MEMORY_THINKING] ?: d.memoryThinking,
+            // STEP 6: older saved files have no such value yet: then the
+            // default (search ON) is used.
+            memorySearch = p[Keys.MEMORY_SEARCH] ?: d.memorySearch
         )
     }
 
@@ -138,6 +147,7 @@ class SettingsStore(context: Context) {
             p[Keys.AUTO_NAME] = s.autoNameChats
             p[Keys.MAX_REPLY] = s.maxReplyTokens
             p[Keys.MEMORY_THINKING] = s.memoryThinking      // PHASE 4
+            p[Keys.MEMORY_SEARCH] = s.memorySearch          // STEP 6
         }
     }
 }
