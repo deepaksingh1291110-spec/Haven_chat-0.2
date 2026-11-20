@@ -1,9 +1,9 @@
 // =====================================================================
 // HavenApp.kt  (app/src/main/java/com/haven/chat/ui/)
 // WHAT: The ROOT of the whole app UI. It joins everything:
-//         - two pages with navigation: "chat" and "settings"
+//         - three pages with navigation: "chat", "settings" and "privacy"
 //         - the side drawer, which slides over the chat page
-//         - the two ViewModels (chat data, settings data)
+//         - the ViewModels (chat data, settings data, memories data)
 // WHO CALLS IT: MainActivity calls HavenApp() once.
 // STORAGE PERMISSION: Only an Activity can check or ask for "All files
 //   access". So MainActivity does that and hands us two things:
@@ -48,6 +48,12 @@
 //     and CLOSES the drawer, so the memory dialog (progress, Cancel, then
 //     the result) is visible on the chat screen. "Delete without saving"
 //     still calls chatViewModel.deleteChat(id), as before.
+//   Step 5 (marked "PHASE 4 / PRIVACY"):
+//   - A third page "privacy" (PrivacyScreen). The drawer row "Privacy &
+//     local data" closes the drawer and opens it. The page has its own
+//     ViewModel (PrivacyViewModel), created only when the page is opened:
+//     it shows the saved memories (live list) and edits or deletes them.
+//     The back arrow returns to the chat.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -73,13 +79,16 @@ import com.haven.chat.engine.EngineManager
 import com.haven.chat.ui.chat.ChatScreen
 import com.haven.chat.ui.chat.ChatViewModel
 import com.haven.chat.ui.drawer.DrawerContent
+import com.haven.chat.ui.privacy.PrivacyScreen
+import com.haven.chat.ui.privacy.PrivacyViewModel
 import com.haven.chat.ui.settings.SettingsScreen
 import com.haven.chat.ui.settings.SettingsViewModel
 import kotlinx.coroutines.launch
 
-// Names of our two pages. Using constants avoids typos.
+// Names of our pages. Using constants avoids typos.
 private const val ROUTE_CHAT = "chat"
 private const val ROUTE_SETTINGS = "settings"
+private const val ROUTE_PRIVACY = "privacy"      // PHASE 4 / PRIVACY
 
 @Composable
 fun HavenApp(
@@ -168,6 +177,11 @@ fun HavenApp(
                                 scope.launch { drawerState.close() }
                                 navController.navigate(ROUTE_SETTINGS)
                             },
+                            // PHASE 4 / PRIVACY: open the memories screen.
+                            onPrivacyClick = {
+                                scope.launch { drawerState.close() }
+                                navController.navigate(ROUTE_PRIVACY)
+                            },
                             onCloseClick = {
                                 scope.launch { drawerState.close() }
                             }
@@ -228,6 +242,29 @@ fun HavenApp(
                 // We stay on this page so the button can show "Loading...".
                 onLoadModel = { draft -> settingsViewModel.saveSettings(draft) },
                 onStorageClick = onRequestStorageAccess
+            )
+        }
+
+        // ================= PAGE 3: PRIVACY & LOCAL DATA =================
+        // PHASE 4 / PRIVACY: the saved memories. The ViewModel is created
+        // here, when the page is opened (it belongs to this page only).
+        composable(ROUTE_PRIVACY) {
+            val privacyViewModel: PrivacyViewModel = viewModel()
+
+            // The memories are a LIVE list (null = still loading), so the
+            // screen redraws by itself after every edit or delete.
+            val memories by privacyViewModel.memories.collectAsState()
+
+            PrivacyScreen(
+                memories = memories,
+                problem = privacyViewModel.problem,
+                onBack = { navController.popBackStack() },
+                onUpdateMemory = { id, question, answer ->
+                    privacyViewModel.updateMemory(id, question, answer)
+                },
+                onDeleteMemory = { id -> privacyViewModel.deleteMemory(id) },
+                onDeleteAll = { privacyViewModel.deleteAllMemories() },
+                onClearProblem = { privacyViewModel.clearProblem() }
             )
         }
     }

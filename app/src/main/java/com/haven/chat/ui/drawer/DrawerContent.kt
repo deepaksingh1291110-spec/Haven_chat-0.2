@@ -32,7 +32,8 @@
 //     of the phone's cores are used. The facts come from HardwareInfo.kt.
 //     No new parameters are needed: the card reads them once by itself.
 //
-// PHASE 4 CHANGES (marked "PHASE 4"): DELETE ASKS ABOUT MEMORIES FIRST.
+// PHASE 4 CHANGES (marked "PHASE 4"):
+//   Step 4 - DELETE ASKS ABOUT MEMORIES FIRST.
 //   The delete dialog now has THREE buttons:
 //     1) "Save personal things, then delete"  -> onSaveAndDeleteChat(id)
 //        Gemma first finds the personal things in the chat and saves them
@@ -42,8 +43,12 @@
 //     3) "Cancel"                             -> nothing happens.
 //   Memories that were saved before stay in every case: deleting a chat
 //   never deletes its memories.
-//   The new callback has a default value ({}), so this file compiles even
-//   before HavenApp.kt passes it.
+//   Step 5 - PRIVACY ROW WORKS.
+//   The row "Privacy & local data" (it did nothing before) now calls
+//   onPrivacyClick. HavenApp closes the drawer and opens the privacy
+//   screen, where the saved memories can be seen, edited and deleted.
+//   Both new callbacks have a default value ({}), so this file compiles
+//   even before HavenApp.kt passes them.
 // =====================================================================
 package com.haven.chat.ui.drawer
 
@@ -129,6 +134,7 @@ fun DrawerContent(
     onDeleteChat: (Long) -> Unit,        // PHASE 3: chat id (after the user chose "Delete without saving")
     onSaveAndDeleteChat: (Long) -> Unit = {}, // PHASE 4: chat id (after the user chose "Save personal things, then delete")
     onSettingsClick: () -> Unit,
+    onPrivacyClick: () -> Unit = {},     // PHASE 4: the "Privacy & local data" row was tapped
     onCloseClick: () -> Unit
 ) {
     // Group by section name ("Today", "Yesterday"...). Result: Map<name, list>.
@@ -253,7 +259,8 @@ fun DrawerContent(
             )
             PreferenceRow(Icons.Outlined.Settings, "Settings", onSettingsClick)
             PreferenceRow(Icons.Outlined.Memory, "Model management") { /* TODO later */ }
-            PreferenceRow(Icons.Outlined.Shield, "Privacy & local data") { /* TODO later */ }
+            // PHASE 4: this row works now (it opens the memories screen).
+            PreferenceRow(Icons.Outlined.Shield, "Privacy & local data", onPrivacyClick)
             PreferenceRow(Icons.Outlined.Storage, "Storage & cache") { /* TODO later */ }
             PreferenceRow(Icons.Outlined.Info, "About Haven") { /* TODO later */ }
             Spacer(Modifier.height(24.dp))
