@@ -3,7 +3,7 @@
 // WHAT: The settings screen from your design:
 //         top bar:  [back]  Settings            [Save & Reload]
 //         card:     Model Configuration (threads, context, thinking,
-//                   auto-name chats, memory thinking)
+//                   auto-name chats, memory thinking, memory search)
 //         field:    model file path + Browse button
 //         card:     Storage Status (file access allowed or not)
 //         button:   Load Model
@@ -42,7 +42,7 @@
 //   the last valid number is kept. Saving to disk is done by SettingsStore,
 //   and ChatViewModel uses the value instead of the old fixed 1024.
 //
-// PHASE 4 CHANGES (marked "PHASE 4"):
+// PHASE 4 CHANGES (marked "PHASE 4" and "STEP 6"):
 //   - New setting "Memory thinking" (default ON): a switch in the Model
 //     Configuration card. AppSettings has a new field memoryThinking. It
 //     decides whether Gemma uses thinking when it looks for the PERSONAL
@@ -53,6 +53,13 @@
 //     normal chat. Saving to disk is done by SettingsStore.
 //   - The Load Model button is also switched off while Gemma is saving
 //     memories (the engine is busy then), and says "Saving memories...".
+//   - STEP 6: new setting "Memory search" (default ON): a switch right under
+//     "Memory thinking". AppSettings has a new field memorySearch. ON means
+//     Gemma may look up the saved memories during a chat answer (the
+//     search_memory tool) when the user asks about their own past. OFF means
+//     Gemma never gets the tool, and the chat works exactly as before. The
+//     tool adds a few lines to every chat prompt, so the switch is the way
+//     to turn it off if it ever gets in the way.
 //
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
@@ -151,7 +158,8 @@ data class AppSettings(
     val stopSequence: String = DEFAULT_STOP_SEQUENCE,
     val autoNameChats: Boolean = false,            // PHASE 3: let Gemma title new chats (default OFF)
     val maxReplyTokens: Int = DEFAULT_MAX_REPLY_TOKENS, // longest reply in tokens (thinking + answer), typed by the user
-    val memoryThinking: Boolean = true             // PHASE 4: use thinking when Gemma looks for personal messages (default ON)
+    val memoryThinking: Boolean = true,            // PHASE 4: use thinking when Gemma looks for personal messages (default ON)
+    val memorySearch: Boolean = true               // STEP 6: Gemma may search the saved memories in a chat (default ON)
 )
 
 // ---------------------------------------------------------------------
@@ -417,6 +425,32 @@ fun SettingsScreen(
                     Switch(
                         checked = draft.memoryThinking,
                         onCheckedChange = { draft = draft.copy(memoryThinking = it) }
+                    )
+                }
+
+                // --- STEP 6: Memory search switch ---
+                // ON (default): during a chat answer Gemma may look up your
+                // saved memories (the search_memory tool) when you ask about
+                // your own past. It only does this when you have saved
+                // memories.
+                // OFF: Gemma never gets the tool; chat works as before.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Memory search", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = "Gemma may look up your saved memories when you ask " +
+                                    "about your own past.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = draft.memorySearch,
+                        onCheckedChange = { draft = draft.copy(memorySearch = it) }
                     )
                 }
             }
