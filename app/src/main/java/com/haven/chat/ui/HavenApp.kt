@@ -54,6 +54,10 @@
 //     ViewModel (PrivacyViewModel), created only when the page is opened:
 //     it shows the saved memories (live list) and edits or deletes them.
 //     The back arrow returns to the chat.
+//   Step 7 (marked "STEP 7"):
+//   - The privacy page now also edits the TAGS of a memory:
+//     onUpdateMemory gives (id, question, answer, tags) and goes straight
+//     to PrivacyViewModel.updateMemory.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -259,8 +263,9 @@ fun HavenApp(
                 memories = memories,
                 problem = privacyViewModel.problem,
                 onBack = { navController.popBackStack() },
-                onUpdateMemory = { id, question, answer ->
-                    privacyViewModel.updateMemory(id, question, answer)
+                // STEP 7: the edit now includes the tags.
+                onUpdateMemory = { id, question, answer, tags ->
+                    privacyViewModel.updateMemory(id, question, answer, tags)
                 },
                 onDeleteMemory = { id -> privacyViewModel.deleteMemory(id) },
                 onDeleteAll = { privacyViewModel.deleteAllMemories() },

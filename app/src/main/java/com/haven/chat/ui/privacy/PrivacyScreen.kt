@@ -5,9 +5,10 @@
 //       user manage them:
 //         top bar:  [back]  Privacy & local data        [Delete all]
 //         card:     what this screen is, and how many memories there are
-//         cards:    one card per memory: date, the user's question,
-//                   Gemma's final answer, and a delete (trash) icon
-//         tap a card -> a dialog to EDIT the question and the answer
+//         cards:    one card per memory: date, the user's question, the
+//                   TAGS Gemma wrote for it, Gemma's final answer, and a
+//                   delete (trash) icon
+//         tap a card -> a dialog to EDIT the question, the answer and the tags
 //         trash icon -> asks "Delete this memory?" first
 //         Delete all -> asks "Delete all N memories?" first
 // DESIGN RULE: this screen is "stateless", like ChatScreen. It does NOT
@@ -19,6 +20,17 @@
 //   that were copied from the chat, word for word. The date is the day the
 //   user WROTE the question (not the day it was saved).
 //
+// STEP 7 CHANGES (marked "STEP 7"):
+//   - TAGS. Every memory card shows its tags (the 4 to 6 search keywords
+//     Gemma wrote), in the accent color, between the question and the
+//     answer. A memory without tags (saved before step 7, or Gemma gave
+//     none) says "No tags" in gray. This is how the user checks and tunes
+//     the memory prompt: run "remember my personal things", then look here.
+//   - The edit dialog has a third box, "Tags", with the tags as text
+//     separated by commas. Editing the question, the answer or the tags
+//     makes the search vector of that memory old, so it is made again later.
+//   - onUpdateMemory now gives (id, question, answer, tags).
+//
 // THE LIST CAN BE NULL: null = still loading (nothing is drawn yet),
 //   an empty list = loaded, no memories (a short help text is drawn).
 //
@@ -28,7 +40,7 @@
 //   - a memory that was deleted here is NOT made again from the same chat
 //     (the chat's marker stays, see MemoryDao.kt).
 //
-// USED BY: HavenApp.kt (a new page "privacy", next step).
+// USED BY: HavenApp.kt (the page "privacy").
 // =====================================================================
 package com.haven.chat.ui.privacy
 
@@ -71,6 +83,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.haven.chat.data.MemoryEntity
+import com.haven.chat.data.tagsFromText
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -80,6 +93,7 @@ import java.util.Locale
 // (The full text is always visible in the edit dialog.)
 private const val QUESTION_PREVIEW_LINES = 3
 private const val ANSWER_PREVIEW_LINES = 4
+private const val TAGS_PREVIEW_LINES = 2
 
 // The date format on a card, for example "19 Nov 2026".
 private val DATE_FORMAT: DateTimeFormatter =
@@ -96,7 +110,7 @@ fun PrivacyScreen(
     memories: List<MemoryEntity>?,                         // null = still loading
     problem: String?,                                      // a plain-words problem, or null
     onBack: () -> Unit,                                    // back arrow tapped
-    onUpdateMemory: (Long, String, String) -> Unit,        // id, new question, new answer
+    onUpdateMemory: (Long, String, String, String) -> Unit, // id, new question, new answer, new tags (STEP 7)
     onDeleteMemory: (Long) -> Unit,                        // id (after the user confirmed)
     onDeleteAll: () -> Unit,                               // after the user confirmed
     onClearProblem: () -> Unit                             // the problem dialog was closed
@@ -195,8 +209,8 @@ fun PrivacyScreen(
     editTarget?.let { memory ->
         EditDialog(
             memory = memory,
-            onSave = { question, answer ->
-                onUpdateMemory(memory.id, question, answer)
+            onSave = { question, answer, tags ->
+                onUpdateMemory(memory.id, question, answer, tags)
                 editTarget = null
             },
             onDismiss = { editTarget = null }
@@ -290,6 +304,7 @@ private fun InfoCard(count: Int, loaded: Boolean) {
             text = "Only your personal things are saved here: your question and " +
                     "Gemma's final answer, word for word. They stay on this phone, " +
                     "and they stay even when a chat is deleted. " +
+                    "Each memory also has tags: short search keywords that Gemma wrote. " +
                     "Tap a memory to edit it.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -306,7 +321,8 @@ private fun InfoCard(count: Int, loaded: Boolean) {
 
 // ---------------------------------------------------------------------
 // ONE memory card: date + trash icon on top, then the question, then the
-// answer (cut after a few lines). Tapping the card opens the edit dialog.
+// tags (STEP 7), then the answer (cut after a few lines). Tapping the card
+// opens the edit dialog.
 // ---------------------------------------------------------------------
 @Composable
 private fun MemoryCard(
@@ -314,6 +330,9 @@ private fun MemoryCard(
     onClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
+    // STEP 7: the tags as a list ("a, b, c" -> [a, b, c]).
+    val tags = tagsFromText(memory.tags)
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -353,6 +372,25 @@ private fun MemoryCard(
                 maxLines = QUESTION_PREVIEW_LINES,
                 overflow = TextOverflow.Ellipsis
             )
+
+            // STEP 7: the tags. Accent color when there are some, gray
+            // "No tags" when there are none.
+            if (tags.isEmpty()) {
+                Text(
+                    text = "No tags",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Text(
+                    text = tags.joinToString("  \u00B7  "),       // tag  ·  tag  ·  tag
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = TAGS_PREVIEW_LINES,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
             val answer = memory.answer
             if (answer.isNullOrBlank()) {
                 Text(
@@ -374,20 +412,22 @@ private fun MemoryCard(
 }
 
 // ---------------------------------------------------------------------
-// The edit dialog: two text boxes (question, answer) and [Cancel] [Save].
-// The texts start with the saved values. Save is allowed only when the
-// question is not empty. An empty answer is allowed (it means "no answer").
-// The content scrolls, because an answer can be long.
+// The edit dialog: three text boxes (question, tags, answer) and
+// [Cancel] [Save]. The texts start with the saved values. Save is allowed
+// only when the question is not empty. An empty answer is allowed (it means
+// "no answer"), and so are empty tags. The content scrolls, because an
+// answer can be long.
 // ---------------------------------------------------------------------
 @Composable
 private fun EditDialog(
     memory: MemoryEntity,
-    onSave: (String, String) -> Unit,
+    onSave: (String, String, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     // The texts being edited. "remember(memory.id)" makes them start again
     // from the saved values if a different memory is opened.
     var question by remember(memory.id) { mutableStateOf(memory.question) }
+    var tags by remember(memory.id) { mutableStateOf(memory.tags) }
     var answer by remember(memory.id) { mutableStateOf(memory.answer ?: "") }
 
     AlertDialog(
@@ -407,6 +447,16 @@ private fun EditDialog(
                     minLines = 2,
                     maxLines = 8
                 )
+                // STEP 7: the tags, as text separated by commas.
+                OutlinedTextField(
+                    value = tags,
+                    onValueChange = { tags = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Tags (separated by commas)") },
+                    supportingText = { Text("4 to 6 short words that would find this memory.") },
+                    minLines = 1,
+                    maxLines = 4
+                )
                 OutlinedTextField(
                     value = answer,
                     onValueChange = { answer = it },
@@ -419,7 +469,7 @@ private fun EditDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onSave(question, answer) },
+                onClick = { onSave(question, answer, tags) },
                 enabled = question.isNotBlank()          // an empty question is not allowed
             ) {
                 Text("Save")

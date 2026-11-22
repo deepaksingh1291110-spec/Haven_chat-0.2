@@ -39,10 +39,10 @@
 //      the memory job INSTEAD of a normal message. The phrase is never
 //      saved as a chat message and never sent to Gemma as a question.
 //   2) The job itself is MemoryExtractor.kt: Gemma only DECIDES which of
-//      the user's messages are personal; the app copies each personal
-//      question and its saved final answer, word for word, into the
-//      memories database (a separate file, memories.db). Deleting a chat
-//      never deletes its memories.
+//      the user's messages are personal (and writes their tags); the app
+//      copies each personal question and its saved final answer, word for
+//      word, into the memories database (a separate file, memories.db).
+//      Deleting a chat never deletes its memories.
 //   3) While the job runs, "memoryJob" holds the progress for a dialog
 //      (progress, a Cancel button, and at the end a short result text).
 //      The dialog is drawn by ChatScreen.
@@ -82,9 +82,16 @@
 //   the user's own life. That is fine: the user can delete it on the
 //   Privacy & local data screen.)
 //
+// PHASE 4, STEP 7 (marked "STEP 7"): THE EDITED MEMORY PROMPT.
+//   The memory job now hands the extraction prompt from Settings to the
+//   extractor: effectiveMemoryPrompt(settings) = the prompt the user edited
+//   in the "Memory Prompt Editor" card, or the built-in one when none was
+//   edited. This is what lets the user tune the prompt by trial and error
+//   on the phone, without rebuilding the app. (The change takes effect
+//   after Save & Reload in Settings.)
+//
 // STILL TEMPORARY:
-//   - No heavy search (embedder + reranker): only built if light search
-//     turns out not to be enough.
+//   - Heavy search (embedder + reranker) is not wired here yet.
 //
 // IDS: messages shown on screen need a unique id for the list. Messages
 //   loaded from the database keep their database id (positive numbers).
@@ -110,6 +117,7 @@ import com.haven.chat.engine.MemoryExtractor
 import com.haven.chat.engine.MemoryJobResult
 import com.haven.chat.engine.MemorySearch
 import com.haven.chat.ui.settings.SettingsViewModel
+import com.haven.chat.ui.settings.effectiveMemoryPrompt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -635,7 +643,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             total = p.total,
                             saved = p.saved
                         )
-                    }
+                    },
+                    // STEP 7: the extraction prompt from Settings (the user's
+                    // edited one, or the built-in one).
+                    extractionPrompt = effectiveMemoryPrompt(s)
                 )
 
                 when {

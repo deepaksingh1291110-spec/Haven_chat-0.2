@@ -4,11 +4,11 @@
 //       saved memories (the "fair notebook") for the screen to draw, and
 //       does what the user asks there:
 //         - show the list of memories (live: it updates by itself),
-//         - edit one memory,
+//         - edit one memory (question, answer and, STEP 7, its tags),
 //         - delete one memory,
 //         - delete ALL memories.
-//       PrivacyScreen.kt (next file) only DRAWS what this class holds and
-//       reports taps upward, like ChatScreen / ChatViewModel.
+//       PrivacyScreen.kt only DRAWS what this class holds and reports taps
+//       upward, like ChatScreen / ChatViewModel.
 //
 // WHY A VIEWMODEL: so the list and a half-finished edit survive a screen
 //   rotation, and so the screen itself stays simple.
@@ -29,6 +29,13 @@
 // NEVER CRASHES ON A DATABASE PROBLEM: if the database refuses a change
 //   (for example the phone storage is full), "problem" gets a plain-words
 //   text and the screen shows it. The list is simply unchanged.
+//
+// STEP 7 CHANGE (marked "STEP 7"):
+//   updateMemory() has a version with the TAGS (as comma-separated text,
+//   for example "brother, rahul, kotlin"). The repository cleans them and
+//   also drops the memory's search vector (it no longer matches the new
+//   text; it is made again later). The older version without tags is kept:
+//   the memory keeps the tags it has.
 // =====================================================================
 package com.haven.chat.ui.privacy
 
@@ -69,9 +76,24 @@ class PrivacyViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Saves the user's edit of one memory. The question must not be empty
-     * (the repository ignores an empty one); an empty answer becomes "no
-     * answer". The date the user wrote it stays as it was.
+     * STEP 7: saves the user's edit of one memory, tags included.
+     * The question must not be empty (the repository ignores an empty one);
+     * an empty answer becomes "no answer". [tags] is text with commas, for
+     * example "brother, rahul, kotlin". The date the user wrote it stays as
+     * it was.
+     */
+    fun updateMemory(memoryId: Long, question: String, answer: String, tags: String) {
+        viewModelScope.launch {
+            try {
+                repo.updateMemory(memoryId, question, answer, tags)
+            } catch (e: SQLiteException) {
+                problem = "The memory could not be saved. Is the phone storage full?"
+            }
+        }
+    }
+
+    /**
+     * The older version without tags: the memory keeps the tags it has.
      */
     fun updateMemory(memoryId: Long, question: String, answer: String) {
         viewModelScope.launch {
@@ -85,7 +107,7 @@ class PrivacyViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Deletes ONE memory. The database wipes it from the file
-     * (secure_delete is ON in memories.db).
+     * (secure_delete is ON in memories.db), and its search vector goes with it.
      */
     fun deleteMemory(memoryId: Long) {
         viewModelScope.launch {
