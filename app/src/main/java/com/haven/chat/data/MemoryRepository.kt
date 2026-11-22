@@ -14,9 +14,12 @@
 //   - removeMarker(): called when a chat is deleted
 //   - (step 6) allMemories() and count(): what the keyword search for
 //     Gemma needs
+//   - (step 7) the VECTORS for heavy search: which memories still need one,
+//     save them, read them all back, and fetch the memories behind the best
+//     vectors
 //
-// WHY A SEPARATE CLASS: if the database changes later (for example vectors
-//   for heavy search), only this file has to change, not every screen.
+// WHY A SEPARATE CLASS: if the database changes later, only this file has
+//   to change, not every screen.
 //
 // THREADS: Room runs its queries on its own background threads, so the
 //   "suspend" functions below are safe to call from the main thread
@@ -24,16 +27,26 @@
 //   value by itself whenever the memories change.
 //
 // NOTHING HERE TALKS TO GEMMA. This class only stores and loads. Which
-//   messages are personal is decided elsewhere (later steps); this class
-//   just receives the final pairs and saves them word for word.
+//   messages are personal is decided elsewhere; this class just receives
+//   the final pairs (with their tags) and saves them word for word.
 //
-// PHASE 4, STEP 6 (the only change in this file, marked "STEP 6"):
-//   allMemories() and count(). They never throw: a database problem gives
-//   null (allMemories) or 0 (count), so a problem in the memory search can
-//   never crash a chat answer.
+// NEVER CRASHES ON A DATABASE PROBLEM: the functions added in steps 6 and 7
+//   catch SQLiteException and give null / 0 / false, so a problem in the
+//   memory search or in the vector making can never crash a chat answer.
+//
+// STEP 7 CHANGES (marked "STEP 7"):
+//   - NewMemory has the tags Gemma wrote; saveBatch() saves them as text.
+//   - updateMemory() has a version with tags. It goes through
+//     MemoryDao.editMemory(), which also drops the memory's vector (it
+//     would no longer match the new text). The old 3-parameter version is
+//     kept; it keeps the memory's current tags.
+//   - memoriesToEmbed / saveVectors / loadVectors / memoriesByIds /
+//     vectorCount: the vector side. A vector is a FloatArray here; the
+//     conversion to and from the BLOB bytes is done in this file.
 //
 // USED BY: the extraction code (saveBatch, markers), the delete-chat flow
-//   (removeMarker), the Privacy & local data screen, and the memory search.
+//   (removeMarker), the Privacy & local data screen, the memory search and
+//   the vector making.
 // =====================================================================
 package com.haven.chat.data
 
@@ -52,12 +65,25 @@ import kotlinx.coroutines.flow.Flow
 //   questionMessageId the id of the question message in haven.db (a REAL
 //                     database id, never a temporary negative one). It stops
 //                     the same message from being saved twice.
+//   tags              STEP 7: the 4 to 6 tags Gemma wrote for the question
+//                     (may be empty if Gemma gave none).
 // ---------------------------------------------------------------------
 class NewMemory(
     val question: String,
     val answer: String?,
     val questionTime: Long,
-    val questionMessageId: Long
+    val questionMessageId: Long,
+    val tags: List<String> = emptyList()
+)
+
+// ---------------------------------------------------------------------
+// STEP 7: one vector, as the search uses it.
+//   memoryId  the memory it belongs to
+//   vector    the numbers (1024 for bge-m3)
+// ---------------------------------------------------------------------
+class StoredVector(
+    val memoryId: Long,
+    val vector: FloatArray
 )
 
 class MemoryRepository(context: Context) {
@@ -74,7 +100,7 @@ class MemoryRepository(context: Context) {
      * All memories, newest first, as a LIVE stream: a new list arrives by
      * itself after every change (saved, edited, deleted). The screens use
      * MemoryEntity directly: it already holds everything they show
-     * (question, answer, date).
+     * (question, answer, tags, date).
      */
     fun observeMemories(): Flow<List<MemoryEntity>> = dao.observeMemories()
 
@@ -116,25 +142,42 @@ class MemoryRepository(context: Context) {
     // -----------------------------------------------------------------
 
     /**
-     * Saves the user's edit of a memory. The question must not be empty
-     * (an empty question is ignored). An empty answer becomes "no answer".
-     * The date the user wrote it stays as it was.
+     * STEP 7: saves the user's edit of a memory, tags included.
+     * The question must not be empty (an empty question is ignored). An
+     * empty answer becomes "no answer". The tags are written as text with
+     * commas ("brother, rahul, kotlin"); they are cleaned here (spaces,
+     * empty parts). The date the user wrote it stays as it was.
+     * The memory's vector is deleted in the same step (it no longer matches
+     * the text); the vector is made again later.
      */
-    suspend fun updateMemory(memoryId: Long, question: String, answer: String) {
+    suspend fun updateMemory(memoryId: Long, question: String, answer: String, tags: String) {
         val q = question.trim()
         if (q.isEmpty()) return
         val a = answer.trim().ifEmpty { null }
-        dao.updateMemory(memoryId, q, a, System.currentTimeMillis())
+        val t = tagsToText(tagsFromText(tags))
+        dao.editMemory(memoryId, q, a, t, System.currentTimeMillis())
     }
 
-    /** Deletes one memory. The database wipes it from the file (secure_delete). */
+    /**
+     * The older version without tags: the memory keeps the tags it has.
+     * (Does nothing if the memory does not exist any more.)
+     */
+    suspend fun updateMemory(memoryId: Long, question: String, answer: String) {
+        val current = dao.getMemory(memoryId) ?: return
+        updateMemory(memoryId, question, answer, current.tags)
+    }
+
+    /**
+     * Deletes one memory. The database wipes it from the file
+     * (secure_delete), and its vector goes with it.
+     */
     suspend fun deleteMemory(memoryId: Long) {
         dao.deleteMemory(memoryId)
     }
 
     /**
-     * Deletes ALL memories. The markers stay on purpose: memories that the
-     * user deleted are not made again from the same chats.
+     * Deletes ALL memories (and all vectors). The markers stay on purpose:
+     * memories that the user deleted are not made again from the same chats.
      */
     suspend fun deleteAllMemories() {
         dao.deleteAllMemories()
@@ -159,8 +202,9 @@ class MemoryRepository(context: Context) {
      * to [lastMessageId], both in ONE database step (all or nothing).
      *
      *   chatId        the chat the batch came from
-     *   memories      the personal pairs of this batch. May be EMPTY: then
-     *                 only the marker moves, so the batch is not read again.
+     *   memories      the personal pairs of this batch, with their tags.
+     *                 May be EMPTY: then only the marker moves, so the
+     *                 batch is not read again.
      *   lastMessageId the highest message id of the whole batch (personal
      *                 or not): everything up to it has now been checked.
      *
@@ -192,7 +236,8 @@ class MemoryRepository(context: Context) {
                     createdAt = m.questionTime,
                     savedAt = now,
                     sourceChatId = chatId,               // reference only, no link
-                    sourceMessageId = m.questionMessageId
+                    sourceMessageId = m.questionMessageId,
+                    tags = tagsToText(m.tags)            // STEP 7
                 )
             }
 
@@ -209,5 +254,86 @@ class MemoryRepository(context: Context) {
      */
     suspend fun removeMarker(chatId: Long) {
         dao.deleteMarker(chatId)
+    }
+
+    // -----------------------------------------------------------------
+    // STEP 7: VECTORS (heavy search)
+    // -----------------------------------------------------------------
+
+    /**
+     * The memories that still need a vector from the embedding model
+     * [model], oldest first. Only memories WITH tags (see MemoryDao).
+     * Returns null when the database could not be read. Never throws.
+     */
+    suspend fun memoriesToEmbed(model: String): List<MemoryEntity>? {
+        return try {
+            dao.getMemoriesWithoutVector(model)
+        } catch (e: SQLiteException) {
+            null
+        }
+    }
+
+    /**
+     * Saves the vectors that the embedding model [model] made.
+     * Each pair is (memory id, its vector). A memory that already has a
+     * vector gets it replaced. Returns true when all were saved, false on a
+     * database problem. Never throws.
+     */
+    suspend fun saveVectors(model: String, vectors: List<StoredVector>): Boolean {
+        if (vectors.isEmpty()) return true
+        return try {
+            dao.insertVectors(
+                vectors.map { v ->
+                    MemoryVectorEntity(
+                        memoryId = v.memoryId,
+                        model = model,
+                        dimension = v.vector.size,
+                        vector = v.vector.toVectorBytes()
+                    )
+                }
+            )
+            true
+        } catch (e: SQLiteException) {
+            false
+        }
+    }
+
+    /**
+     * ALL vectors of the embedding model [model], once, ready to compare.
+     * Returns null when the database could not be read. Never throws.
+     */
+    suspend fun loadVectors(model: String): List<StoredVector>? {
+        return try {
+            dao.getVectors(model).map { StoredVector(it.memoryId, it.vector.toVectorFloats()) }
+        } catch (e: SQLiteException) {
+            null
+        }
+    }
+
+    /**
+     * The memories with these ids (the ones behind the best vectors), in
+     * the SAME ORDER as [ids]. An id that no longer exists is skipped.
+     * Returns null when the database could not be read. Never throws.
+     */
+    suspend fun memoriesByIds(ids: List<Long>): List<MemoryEntity>? {
+        if (ids.isEmpty()) return emptyList()
+        return try {
+            val byId = dao.getMemoriesByIds(ids).associateBy { it.id }
+            ids.mapNotNull { byId[it] }
+        } catch (e: SQLiteException) {
+            null
+        }
+    }
+
+    /**
+     * How many vectors the embedding model [model] has made. 0 also when the
+     * database could not be read. Never throws.
+     */
+    suspend fun vectorCount(model: String): Int {
+        return try {
+            dao.getVectorCount(model)
+        } catch (e: SQLiteException) {
+            0
+        }
     }
 }

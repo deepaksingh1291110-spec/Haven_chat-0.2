@@ -3,11 +3,16 @@
 // WHAT: The settings screen from your design:
 //         top bar:  [back]  Settings            [Save & Reload]
 //         card:     Model Configuration (threads, context, thinking,
-//                   auto-name chats, memory thinking, memory search)
+//                   auto-name chats, memory thinking, memory search,
+//                   heavy search)
+//         card:     Heavy search models (only when heavy search is ON):
+//                   embedder file + reranker file, each with Browse
 //         field:    model file path + Browse button
 //         card:     Storage Status (file access allowed or not)
 //         button:   Load Model
 //         card:     System Prompt Editor (prompt, stop sequence, reset)
+//         card:     Memory Prompt Editor (the prompt that finds the personal
+//                   messages and writes their tags, with reset)
 // HOW IT WORKS: the screen edits a COPY of the settings ("draft").
 //   Nothing is applied until the user taps "Save & Reload" or
 //   "Load Model", which hand the draft to the caller. This matches your
@@ -42,24 +47,31 @@
 //   the last valid number is kept. Saving to disk is done by SettingsStore,
 //   and ChatViewModel uses the value instead of the old fixed 1024.
 //
-// PHASE 4 CHANGES (marked "PHASE 4" and "STEP 6"):
-//   - New setting "Memory thinking" (default ON): a switch in the Model
-//     Configuration card. AppSettings has a new field memoryThinking. It
-//     decides whether Gemma uses thinking when it looks for the PERSONAL
-//     messages of a chat ("remember my personal things from this chat" and
-//     the delete-chat step). Thinking found every personal message in the
-//     user's tests but is slower; OFF is faster but missed some.
-//     It is separate from the "Reasoning" chips above, which are only for
-//     normal chat. Saving to disk is done by SettingsStore.
+// PHASE 4 CHANGES (marked "PHASE 4", "STEP 6" and "STEP 7"):
+//   - "Memory thinking" (default ON): decides whether Gemma uses thinking
+//     when it looks for the PERSONAL messages of a chat. Thinking found
+//     every personal message in the user's tests but is slower.
 //   - The Load Model button is also switched off while Gemma is saving
 //     memories (the engine is busy then), and says "Saving memories...".
-//   - STEP 6: new setting "Memory search" (default ON): a switch right under
-//     "Memory thinking". AppSettings has a new field memorySearch. ON means
-//     Gemma may look up the saved memories during a chat answer (the
-//     search_memory tool) when the user asks about their own past. OFF means
-//     Gemma never gets the tool, and the chat works exactly as before. The
-//     tool adds a few lines to every chat prompt, so the switch is the way
-//     to turn it off if it ever gets in the way.
+//   - STEP 6, "Memory search" (default ON): Gemma may look up the saved
+//     memories during a chat answer (the search_memory tool).
+//   - STEP 7, HEAVY SEARCH:
+//       * "Heavy search" switch (default OFF) in the Model Configuration
+//         card. AppSettings has the new field heavySearch.
+//       * When it is ON, a card "Heavy search models" appears with TWO file
+//         pickers: the embedder (bge-m3) and the reranker
+//         (bge-reranker-v2-m3). AppSettings has embedderPath and
+//         rerankerPath (empty = none chosen). Each picker works like the main
+//         model's Browse button and says if the file was found.
+//       * A card "Memory Prompt Editor" lets the user edit the prompt that
+//         finds the personal messages and writes their 4 to 6 tags, for
+//         trial and error WITHOUT rebuilding the app. AppSettings has the new
+//         field memoryPrompt; EMPTY means "use the built-in prompt"
+//         (MemoryPrompts.DEFAULT_EXTRACTION_PROMPT). "Reset to default"
+//         empties it again. The reply must keep the shape
+//         {"personal": [{"n": 2, "tags": ["..."]}]}, because the app reads it.
+//       * effectiveMemoryPrompt(settings) gives the prompt that is really
+//         used (the edited one, or the built-in one).
 //
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
@@ -120,6 +132,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.haven.chat.engine.EngineManager
+import com.haven.chat.engine.MemoryPrompts
+import java.io.File
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------
@@ -133,6 +147,11 @@ const val DEFAULT_MODEL_PATH = "/storage/emulated/0/HavenModels/gemma4-e2b-q4_0.
 
 private const val MAX_PROMPT_CHARS = 2000   // longest allowed system prompt
 private const val MAX_STOP_CHARS = 100      // longest allowed stop sequence
+
+// STEP 7: longest memory (extraction) prompt. The built-in one is about
+// 3000 characters, so there is plenty of room for edits. Public, because
+// SettingsStore uses it too.
+const val MAX_MEMORY_PROMPT_CHARS = 8000
 
 // PHASE 3: the context window sizes the user can choose.
 // The big ones (16384, 32768) are for phones with a lot of RAM.
@@ -159,8 +178,19 @@ data class AppSettings(
     val autoNameChats: Boolean = false,            // PHASE 3: let Gemma title new chats (default OFF)
     val maxReplyTokens: Int = DEFAULT_MAX_REPLY_TOKENS, // longest reply in tokens (thinking + answer), typed by the user
     val memoryThinking: Boolean = true,            // PHASE 4: use thinking when Gemma looks for personal messages (default ON)
-    val memorySearch: Boolean = true               // STEP 6: Gemma may search the saved memories in a chat (default ON)
+    val memorySearch: Boolean = true,              // STEP 6: Gemma may search the saved memories in a chat (default ON)
+    val heavySearch: Boolean = false,              // STEP 7: heavy search with the embedder + reranker (default OFF)
+    val embedderPath: String = "",                 // STEP 7: the bge-m3 GGUF file ("" = none chosen)
+    val rerankerPath: String = "",                 // STEP 7: the bge-reranker GGUF file ("" = none chosen)
+    val memoryPrompt: String = ""                  // STEP 7: edited extraction prompt ("" = use the built-in one)
 )
+
+/**
+ * STEP 7: the extraction prompt that is REALLY used: the one the user edited
+ * in Settings, or, when none was edited (empty), the built-in prompt.
+ */
+fun effectiveMemoryPrompt(settings: AppSettings): String =
+    settings.memoryPrompt.ifBlank { MemoryPrompts.DEFAULT_EXTRACTION_PROMPT }
 
 // ---------------------------------------------------------------------
 // HELPER: turns the "address" that Android's file picker gives us into a
@@ -189,6 +219,23 @@ private fun pathFromPickedUri(uri: Uri): String? {
     }
 }
 
+// STEP 7: the same checks the main model's Browse button does, for the two
+// search model pickers. If the picked file is usable, [onPath] gets its path
+// and "" is returned; otherwise the plain-words problem is returned.
+private fun checkPickedGguf(uri: Uri, onPath: (String) -> Unit): String {
+    val path = pathFromPickedUri(uri)
+    return when {
+        path == null ->
+            "Cannot use this location. Pick the file from internal storage (for example the HavenModels folder)."
+        !path.endsWith(".gguf", ignoreCase = true) ->
+            "That is not a .gguf file."
+        else -> {
+            onPath(path)
+            ""
+        }
+    }
+}
+
 // ExperimentalLayoutApi is needed for FlowRow (chips that wrap to a new line).
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -205,6 +252,10 @@ fun SettingsScreen(
 
     // A short message under the Browse button (for example "not a .gguf file").
     var browseMessage by remember { mutableStateOf("") }
+
+    // STEP 7: the same kind of message under the two search model pickers.
+    var embedderMessage by remember { mutableStateOf("") }
+    var rerankerMessage by remember { mutableStateOf("") }
 
     // MAX REPLY LENGTH: the text exactly as the user types it. It is kept
     // apart from the draft because "" or "5" is allowed while typing, but
@@ -229,6 +280,22 @@ fun SettingsScreen(
                     ""
                 }
             }
+        }
+    }
+
+    // STEP 7: two more pickers, one for each search model.
+    val embedderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            embedderMessage = checkPickedGguf(uri) { draft = draft.copy(embedderPath = it) }
+        }
+    }
+    val rerankerPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            rerankerMessage = checkPickedGguf(uri) { draft = draft.copy(rerankerPath = it) }
         }
     }
 
@@ -453,6 +520,65 @@ fun SettingsScreen(
                         onCheckedChange = { draft = draft.copy(memorySearch = it) }
                     )
                 }
+
+                // --- STEP 7: Heavy search switch ---
+                // OFF (default): only the quick keyword search above.
+                // ON: Gemma can also do a DEEP search with two small search
+                // models (the embedder finds the closest memories, the
+                // reranker picks the best ones). It is more exact, but slower,
+                // because Gemma is unloaded and loaded again for each deep
+                // search. When it is ON, a card below asks for the two model
+                // files.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Heavy search", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = "Deep memory search with two search models. More exact, " +
+                                    "but slower: Gemma is loaded again for each search.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = draft.heavySearch,
+                        onCheckedChange = { draft = draft.copy(heavySearch = it) }
+                    )
+                }
+            }
+
+            // ================= STEP 7: HEAVY SEARCH MODELS =================
+            // Only visible while the Heavy search switch is ON.
+            if (draft.heavySearch) {
+                SettingsCard(title = "Heavy search models") {
+                    Text(
+                        text = "Choose the two search model files (.gguf) from the phone's " +
+                                "storage. Heavy search stays off until both are chosen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    // The embedder (bge-m3): turns texts into vectors.
+                    ModelPathField(
+                        label = "Embedder file (bge-m3)",
+                        path = draft.embedderPath,
+                        onPathChange = { draft = draft.copy(embedderPath = it) },
+                        onBrowse = { embedderPicker.launch(arrayOf("*/*")) },
+                        message = embedderMessage
+                    )
+
+                    // The reranker (bge-reranker-v2-m3): picks the best matches.
+                    ModelPathField(
+                        label = "Reranker file (bge-reranker-v2-m3)",
+                        path = draft.rerankerPath,
+                        onPathChange = { draft = draft.copy(rerankerPath = it) },
+                        onBrowse = { rerankerPicker.launch(arrayOf("*/*")) },
+                        message = rerankerMessage
+                    )
+                }
             }
 
             // ================= MODEL FILE PATH =================
@@ -597,6 +723,49 @@ fun SettingsScreen(
                 }
             }
 
+            // ================= STEP 7: MEMORY PROMPT EDITOR =================
+            // The prompt that Gemma gets when it looks for the PERSONAL
+            // messages of a chat and writes their tags. The user can edit it
+            // here for trial and error, without rebuilding the app.
+            //   - Empty in the draft = the built-in prompt is used. The box
+            //     then SHOWS the built-in text, so it can be edited from there.
+            //   - "Reset to default" empties the draft's prompt again.
+            // The reply Gemma writes must keep the shape
+            //   {"personal": [{"n": 2, "tags": ["a", "b", "c", "d"]}]}
+            // because the app reads exactly that.
+            SettingsCard(title = "Memory Prompt Editor") {
+                OutlinedTextField(
+                    value = effectiveMemoryPrompt(draft),
+                    onValueChange = {
+                        if (it.length <= MAX_MEMORY_PROMPT_CHARS) draft = draft.copy(memoryPrompt = it)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Prompt for finding personal messages and tags") },
+                    minLines = 8,
+                    maxLines = 16,
+                    supportingText = {
+                        Text(
+                            (if (draft.memoryPrompt.isBlank()) "Built-in prompt in use.  "
+                             else "Your edited prompt in use.  ") +
+                                    "${effectiveMemoryPrompt(draft).length} / $MAX_MEMORY_PROMPT_CHARS"
+                        )
+                    }
+                )
+                Text(
+                    text = "Keep the reply shape: {\"personal\": [{\"n\": 2, \"tags\": [\"a\", \"b\"]}]}. " +
+                            "The app reads exactly that. Press Save & Reload to use your changes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                // Back to the built-in prompt.
+                TextButton(
+                    onClick = { draft = draft.copy(memoryPrompt = "") },
+                    enabled = draft.memoryPrompt.isNotBlank()
+                ) {
+                    Text("Reset to default")
+                }
+            }
+
             // Empty space at the bottom so the last card is not cramped.
             Spacer(Modifier.height(24.dp))
         }
@@ -622,5 +791,57 @@ private fun SettingsCard(
     ) {
         Text(title, style = MaterialTheme.typography.titleMedium)
         content()
+    }
+}
+
+// ---------------------------------------------------------------------
+// STEP 7 HELPER: one model file chooser: a path box that says whether the
+// file exists, a Browse button, and a problem message under it.
+//   label         what the box is called
+//   path          the path now ("" = none chosen yet)
+//   onPathChange  the user typed in the box
+//   onBrowse      the Browse button was tapped (the caller opens the picker)
+//   message       a problem from the picker ("" = none)
+// It draws several things one after another; it is meant to be used inside
+// a SettingsCard (a Column), which spaces them.
+// ---------------------------------------------------------------------
+@Composable
+private fun ModelPathField(
+    label: String,
+    path: String,
+    onPathChange: (String) -> Unit,
+    onBrowse: () -> Unit,
+    message: String
+) {
+    // Does the file exist? (A quick check of one name, fine to do on screen.)
+    val exists = path.isNotBlank() && File(path).exists()
+
+    OutlinedTextField(
+        value = path,
+        onValueChange = onPathChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text(label) },
+        singleLine = true,
+        isError = path.isNotBlank() && !exists,
+        supportingText = {
+            Text(
+                when {
+                    path.isBlank() -> "Not chosen yet."
+                    exists -> "File found."
+                    else -> "No file at this path."
+                }
+            )
+        }
+    )
+    OutlinedButton(onClick = onBrowse) {
+        Icon(Icons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+        Text("  Browse")
+    }
+    if (message.isNotEmpty()) {
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
     }
 }

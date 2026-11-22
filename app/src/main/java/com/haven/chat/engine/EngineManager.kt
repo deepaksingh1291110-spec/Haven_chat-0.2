@@ -75,6 +75,16 @@
 //     then says "Searching memories...".
 //   - generate() has two new parameters with default values, so older
 //     calls still work: tool (null = no tool) and onRestart.
+//
+// PHASE 4, STEP 7 CHANGES (marked "STEP 7"): TAGS FOR EVERY PERSONAL MESSAGE.
+//   - classifyBatch() now gets TAGS from Gemma, not only the numbers. Its
+//     BatchResult has "items": for every personal message its number and its
+//     4 to 6 tags (MemoryPrompts.PersonalItem). The old "personal" list of
+//     numbers is still there (it is taken from the items).
+//   - classifyBatch() has a new parameter "prompt": the extraction system
+//     prompt to use. The caller passes the one from Settings (the user can
+//     edit it there to tune it). It has a default value, so older calls
+//     still work and use the built-in prompt.
 //   Everything else works as before.
 // =====================================================================
 package com.haven.chat.engine
@@ -193,22 +203,27 @@ object EngineManager {
     // PHASE 4: result of one classifyBatch() call
     // -----------------------------------------------------------------
     /**
-     * personal  the numbers (1 = first message of the batch) that Gemma
-     *           marked PERSONAL. An EMPTY list is a valid answer ("none is
-     *           personal"). null = the reply could not be understood, even
-     *           after the second try (see "error" and "cancelled" first).
+     * items     STEP 7: the PERSONAL messages Gemma found, each with its
+     *           number (1 = first message of the batch) and its tags. An
+     *           EMPTY list is a valid answer ("none is personal"). null =
+     *           the reply could not be understood, even after the second
+     *           try (see "error" and "cancelled" first).
      * cancelled true if the user cancelled while the batch was running.
      * error     a plain-words problem (for example "conversation too
      *           long"), or null.
      *
-     * Rule for the caller: ONLY when personal != null may the marker move
+     * Rule for the caller: ONLY when items != null may the marker move
      * forward. In every other case the batch must be treated as NOT done.
      */
     class BatchResult(
-        val personal: List<Int>?,
+        val items: List<MemoryPrompts.PersonalItem>?,
         val cancelled: Boolean,
         val error: String?
-    )
+    ) {
+        /** Only the numbers of the personal messages (no tags), or null. */
+        val personal: List<Int>?
+            get() = items?.map { it.number }
+    }
 
     // -----------------------------------------------------------------
     // STEP 6: a tool that Gemma may call during generate()
@@ -800,7 +815,7 @@ object EngineManager {
     // -----------------------------------------------------------------
     // The job has THREE parts, called one after another by MemoryExtractor:
     //   startMemorizing()      once, at the start  (READY -> MEMORIZING)
-    //   classifyBatch(...)     once per batch of up to 15 user messages
+    //   classifyBatch(...)     once per batch of up to 5 user messages
     //   finishMemorizing(...)  once, at the end    (MEMORIZING -> READY)
     // The state stays MEMORIZING the whole time, so the rest of the app
     // sees the engine as busy (no sending, opening or deleting meanwhile).
@@ -827,22 +842,27 @@ object EngineManager {
     }
 
     /**
-     * Gemma reads ONE batch and says which messages are personal.
+     * Gemma reads ONE batch and says which messages are personal, and which
+     * tags describe each one.
      *   batchMessage  the numbered list from MemoryPrompts.buildBatchMessage()
      *   batchSize     how many messages the list has (valid numbers 1..batchSize)
      *   thinking      the "memory thinking" switch of the Settings screen
+     *   prompt        STEP 7: the extraction system prompt to use (the one the
+     *                 user may have edited in Settings). Default: the built-in
+     *                 prompt of MemoryPrompts.
      * onDone runs on the main thread with a BatchResult (see its notes).
      *
      * Every attempt first starts a CLEAN conversation with the extraction
      * system prompt, so Gemma never sees the user's chat or an earlier
-     * batch. (The price: the short system prompt is read again for every
-     * batch.) Nothing Gemma writes is shown or saved; only the numbers in
-     * its reply are used.
+     * batch. (The price: the system prompt is read again for every batch.)
+     * Nothing Gemma writes is shown or saved; only the numbers and the tags
+     * in its reply are used.
      */
     fun classifyBatch(
         batchMessage: String,
         batchSize: Int,
         thinking: Boolean,
+        prompt: String = MemoryPrompts.EXTRACTION_SYSTEM_PROMPT,
         onDone: (BatchResult) -> Unit
     ) {
         if (state != State.MEMORIZING) {
@@ -858,13 +878,13 @@ object EngineManager {
             }
 
             val result: BatchResult = try {
-                var personal: List<Int>? = null
+                var items: List<MemoryPrompts.PersonalItem>? = null
                 var error: String? = null
                 var cancelled = false
                 var attempt = 0
 
                 // Try again only when the reply was not understood.
-                while (attempt < MEMORY_ATTEMPTS && personal == null && error == null && !cancelled) {
+                while (attempt < MEMORY_ATTEMPTS && items == null && error == null && !cancelled) {
                     attempt++
 
                     // The user may have pressed Cancel between two batches.
@@ -874,7 +894,7 @@ object EngineManager {
                     }
 
                     // Clean conversation with the extraction prompt.
-                    b.resetChat(MemoryPrompts.EXTRACTION_SYSTEM_PROMPT.toByteArray(Charsets.UTF_8))
+                    b.resetChat(prompt.toByteArray(Charsets.UTF_8))
 
                     // The listener IGNORES the text. It only answers
                     // "keep going" (true) or "stop" (false).
@@ -895,10 +915,10 @@ object EngineManager {
                             error = stats.removePrefix("ERROR:").trim()
                         else ->
                             // lastAnswer() = the FINAL answer only (no thinking text).
-                            personal = MemoryPrompts.parsePersonalNumbers(b.lastAnswer(), batchSize)
+                            items = MemoryPrompts.parsePersonalItems(b.lastAnswer(), batchSize)
                     }
                 }
-                BatchResult(personal, cancelled, error)
+                BatchResult(items, cancelled, error)
             } catch (t: Throwable) {
                 BatchResult(null, false, "Reading the messages failed: " + (t.message ?: t.javaClass.simpleName))
             }

@@ -5,17 +5,20 @@
 //         1) read the chat's "last-done marker" (how far it was already read),
 //         2) load the messages that are NEWER than the marker,
 //         3) pair every USER message with the FINAL ANSWER Gemma gave to it,
-//         4) cut the user messages into batches of up to 15,
-//         5) for each batch: ask Gemma "which of these are personal?"
+//         4) cut the user messages into batches of up to 5,
+//         5) for each batch: ask Gemma "which of these are personal, and
+//            which 4 to 6 tags describe each one?"
 //            (EngineManager.classifyBatch + MemoryPrompts.kt),
 //         6) copy the personal questions and their saved final answers,
-//            word for word, into the memories database AND move the marker,
-//            both in ONE database step (MemoryRepository.saveBatch).
+//            word for word, together with the tags, into the memories
+//            database AND move the marker, both in ONE database step
+//            (MemoryRepository.saveBatch).
 //
 // THE MOST IMPORTANT RULES:
-//   - Gemma only DECIDES (it answers with numbers). Nothing Gemma writes is
-//     ever saved. The saved question and answer are copied from the chat
-//     database, so nothing can be invented or rewritten.
+//   - Gemma only DECIDES and TAGS (it answers with numbers and tags).
+//     Nothing else Gemma writes is ever saved. The saved question and
+//     answer are copied from the chat database, so nothing can be invented
+//     or rewritten.
 //   - The answer that is saved is the FINAL answer only. The thinking text
 //     is stored in another column and never touched here.
 //   - The marker moves ONLY after a batch was understood AND saved. If
@@ -45,7 +48,17 @@
 //   job and ALWAYS ends it (also after an error, a cancel or when the
 //   ViewModel is destroyed), so the engine can never stay "busy" by mistake.
 //
-// USED BY (next steps): ChatViewModel (the typed phrase / menu item, and the
+// STEP 7 CHANGES (marked "STEP 7"):
+//   - BATCHES OF 5 (MemoryPrompts.BATCH_SIZE) instead of 15.
+//   - TAGS: Gemma's reply now holds, for every personal message, its number
+//     and its tags (reply.items). The tags are saved with the memory
+//     (NewMemory.tags). A message that Gemma gave no tags is still saved,
+//     just without tags.
+//   - run() has a new parameter "extractionPrompt": the system prompt for
+//     the classifier, taken from Settings (the user can edit it there). It
+//     has a default value (the built-in prompt), so older calls still work.
+//
+// USED BY: ChatViewModel (the typed phrase / bookmark button, and the
 //   delete-chat flow).
 // =====================================================================
 package com.haven.chat.engine
@@ -124,9 +137,12 @@ class MemoryExtractor(
      * Runs the job for one chat. Always returns a result; it never throws
      * for ordinary problems.
      *
-     *   chatId          the chat to read
-     *   memoryThinking  the "memory thinking" switch of the Settings screen
-     *   onProgress      called (on the main thread) after every saved batch
+     *   chatId            the chat to read
+     *   memoryThinking    the "memory thinking" switch of the Settings screen
+     *   onProgress        called (on the main thread) after every saved batch
+     *   extractionPrompt  STEP 7: the system prompt for the classifier. The
+     *                     caller passes the one from Settings; the default is
+     *                     the built-in prompt.
      *
      * What happens to the engine when the job ends (see finishMemorizing):
      *   systemPrompt    the user's normal system prompt
@@ -142,7 +158,8 @@ class MemoryExtractor(
         systemPrompt: String,
         chatThinking: Boolean,
         restoreHistory: () -> List<EngineManager.HistoryItem>,
-        onProgress: (MemoryProgress) -> Unit
+        onProgress: (MemoryProgress) -> Unit,
+        extractionPrompt: String = MemoryPrompts.EXTRACTION_SYSTEM_PROMPT
     ): MemoryJobResult {
         cancelRequested = false
 
@@ -151,7 +168,7 @@ class MemoryExtractor(
         if (problem != null) return MemoryJobResult(false, false, 0, problem)
 
         try {
-            return runBatches(chatId, memoryThinking, onProgress)
+            return runBatches(chatId, memoryThinking, extractionPrompt, onProgress)
         } finally {
             // ALWAYS give the engine back, even after an error or when the
             // coroutine itself was cancelled (NonCancellable lets this last
@@ -168,6 +185,7 @@ class MemoryExtractor(
     private suspend fun runBatches(
         chatId: Long,
         memoryThinking: Boolean,
+        extractionPrompt: String,
         onProgress: (MemoryProgress) -> Unit
     ): MemoryJobResult {
 
@@ -195,7 +213,7 @@ class MemoryExtractor(
             else MemoryJobResult(true, false, 0, null)
         }
 
-        // 4) Batches of up to BATCH_SIZE user messages.
+        // 4) Batches of up to BATCH_SIZE (5) user messages.
         val batches = entries.chunked(MemoryPrompts.BATCH_SIZE)
         var saved = 0
         var checked = 0
@@ -203,32 +221,34 @@ class MemoryExtractor(
         for ((index, batch) in batches.withIndex()) {
             if (cancelRequested) return MemoryJobResult(false, true, saved, null)
 
-            // 5) Ask Gemma which messages of this batch are personal.
-            //    Only the user's texts are sent, never Gemma's answers.
+            // 5) Ask Gemma which messages of this batch are personal, and
+            //    for the tags of each. Only the user's texts are sent,
+            //    never Gemma's answers.
             val batchMessage = MemoryPrompts.buildBatchMessage(batch.map { it.message.text })
-            val reply = classify(batchMessage, batch.size, memoryThinking)
+            val reply = classify(batchMessage, batch.size, memoryThinking, extractionPrompt)
 
             if (reply.cancelled) return MemoryJobResult(false, true, saved, null)
             if (reply.error != null) return fail(reply.error, saved)
 
             // null = the reply was not understood, even after a second try.
             // The marker does NOT move, so nothing is lost.
-            val numbers = reply.personal
+            val personal = reply.items
                 ?: return fail(
                     "Gemma's reply could not be understood. Nothing was lost; try again.",
                     saved
                 )
 
-            // 6) Copy the personal pairs word for word. Number n = the n-th
-            //    message of this batch (numbers start at 1). The reader
-            //    already dropped numbers outside 1..batch.size.
-            val newMemories = numbers.map { n ->
-                val entry = batch[n - 1]
+            // 6) Copy the personal pairs word for word, and add the tags.
+            //    Number n = the n-th message of this batch (numbers start at
+            //    1). The reader already dropped numbers outside 1..batch.size.
+            val newMemories = personal.map { item ->
+                val entry = batch[item.number - 1]
                 NewMemory(
                     question = entry.message.text,
                     answer = entry.answer,
                     questionTime = entry.message.createdAt,
-                    questionMessageId = entry.message.id
+                    questionMessageId = entry.message.id,
+                    tags = item.tags                                  // STEP 7
                 )
             }
 
@@ -294,10 +314,11 @@ class MemoryExtractor(
     private suspend fun classify(
         batchMessage: String,
         batchSize: Int,
-        thinking: Boolean
+        thinking: Boolean,
+        prompt: String
     ): EngineManager.BatchResult = suspendCancellableCoroutine { cont ->
         cont.invokeOnCancellation { EngineManager.cancelMemorizing() }
-        EngineManager.classifyBatch(batchMessage, batchSize, thinking) { result ->
+        EngineManager.classifyBatch(batchMessage, batchSize, thinking, prompt) { result ->
             if (cont.isActive) cont.resume(result)
         }
     }

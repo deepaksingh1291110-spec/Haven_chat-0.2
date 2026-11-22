@@ -19,25 +19,35 @@
 //       threads, contextSize, thinkingEnabled, modelPath, systemPrompt,
 //       stopSequence, autoNameChats, maxReplyTokens (the longest reply,
 //       typed by the user; added after Phase 3), memoryThinking
-//       (PHASE 4: does the memory extraction use thinking?) and
-//       memorySearch (STEP 6: may Gemma search the saved memories?).
+//       (PHASE 4: does the memory extraction use thinking?), memorySearch
+//       (STEP 6: may Gemma search the saved memories?) and, STEP 7, the
+//       heavy search settings: heavySearch, embedderPath, rerankerPath,
+//       and memoryPrompt.
 //
 // IF A VALUE IS MISSING (first start, or a new setting added later), the
 // default from AppSettings is used. So adding new settings in future
 // updates never breaks old saved data.
 //
-// PHASE 4 CHANGES (marked "PHASE 4" and "STEP 6"):
-//   - memoryThinking (key "memory_thinking"): the switch in Settings that
-//     decides whether Gemma uses thinking when it looks for the personal
-//     messages of a chat ("remember my personal things"). Thinking is more
-//     accurate but slower. Default ON.
-//   - memorySearch (key "memory_search"): the switch in Settings that
-//     decides whether Gemma gets the search_memory tool in a chat, so it
-//     can look up the saved memories when the user asks about their own
-//     past. Default ON.
+// PHASE 4 CHANGES (marked "PHASE 4", "STEP 6" and "STEP 7"):
+//   - memoryThinking (key "memory_thinking"): whether Gemma uses thinking
+//     when it looks for the personal messages of a chat. Default ON.
+//   - memorySearch (key "memory_search"): whether Gemma gets the
+//     search_memory tool in a chat. Default ON.
+//   - STEP 7, heavy search:
+//       heavySearch  (key "heavy_search")  the main switch. Default OFF.
+//       embedderPath (key "embedder_path") the bge-m3 GGUF file. Default ""
+//                    (= none chosen yet).
+//       rerankerPath (key "reranker_path") the bge-reranker GGUF file.
+//                    Default "" (= none chosen yet).
+//       memoryPrompt (key "memory_prompt") the extraction prompt the user
+//                    edited in Settings, for trial and error. Default ""
+//                    which means "use the built-in prompt" (see
+//                    MemoryPrompts.kt). Storing nothing until the user
+//                    really edits it means a better built-in prompt in a
+//                    later app version is picked up automatically.
 //   Old saved files have none of these keys: the defaults are used.
-//   NOTE: AppSettings gets the field memorySearch in SettingsScreen.kt (the
-//   next file). Both files go together.
+//   NOTE: AppSettings gets these fields in SettingsScreen.kt (the next
+//   file). Both files go together.
 //
 // "suspend" = a function that may wait (it reads or writes a file). It
 //       must be called from a coroutine (background-friendly code).
@@ -55,6 +65,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.haven.chat.ui.settings.AppSettings
+import com.haven.chat.ui.settings.MAX_MEMORY_PROMPT_CHARS
 import com.haven.chat.ui.settings.MAX_REPLY_TOKENS
 import com.haven.chat.ui.settings.MIN_REPLY_TOKENS
 import kotlinx.coroutines.flow.catch
@@ -88,6 +99,10 @@ class SettingsStore(context: Context) {
         val MAX_REPLY = intPreferencesKey("max_reply_tokens")      // longest reply (tokens)
         val MEMORY_THINKING = booleanPreferencesKey("memory_thinking")   // PHASE 4
         val MEMORY_SEARCH = booleanPreferencesKey("memory_search")       // STEP 6
+        val HEAVY_SEARCH = booleanPreferencesKey("heavy_search")         // STEP 7
+        val EMBEDDER_PATH = stringPreferencesKey("embedder_path")        // STEP 7
+        val RERANKER_PATH = stringPreferencesKey("reranker_path")        // STEP 7
+        val MEMORY_PROMPT = stringPreferencesKey("memory_prompt")        // STEP 7
     }
 
     /**
@@ -127,7 +142,13 @@ class SettingsStore(context: Context) {
             memoryThinking = p[Keys.MEMORY_THINKING] ?: d.memoryThinking,
             // STEP 6: older saved files have no such value yet: then the
             // default (search ON) is used.
-            memorySearch = p[Keys.MEMORY_SEARCH] ?: d.memorySearch
+            memorySearch = p[Keys.MEMORY_SEARCH] ?: d.memorySearch,
+            // STEP 7: heavy search. Older files have none of these keys:
+            // heavy search OFF, no model files chosen, built-in prompt.
+            heavySearch = p[Keys.HEAVY_SEARCH] ?: d.heavySearch,
+            embedderPath = p[Keys.EMBEDDER_PATH] ?: d.embedderPath,
+            rerankerPath = p[Keys.RERANKER_PATH] ?: d.rerankerPath,
+            memoryPrompt = (p[Keys.MEMORY_PROMPT] ?: d.memoryPrompt).take(MAX_MEMORY_PROMPT_CHARS)
         )
     }
 
@@ -148,6 +169,10 @@ class SettingsStore(context: Context) {
             p[Keys.MAX_REPLY] = s.maxReplyTokens
             p[Keys.MEMORY_THINKING] = s.memoryThinking      // PHASE 4
             p[Keys.MEMORY_SEARCH] = s.memorySearch          // STEP 6
+            p[Keys.HEAVY_SEARCH] = s.heavySearch            // STEP 7
+            p[Keys.EMBEDDER_PATH] = s.embedderPath          // STEP 7
+            p[Keys.RERANKER_PATH] = s.rerankerPath          // STEP 7
+            p[Keys.MEMORY_PROMPT] = s.memoryPrompt          // STEP 7
         }
     }
 }
