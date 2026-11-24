@@ -82,16 +82,30 @@
 //   the user's own life. That is fine: the user can delete it on the
 //   Privacy & local data screen.)
 //
-// PHASE 4, STEP 7 (marked "STEP 7"): THE EDITED MEMORY PROMPT.
-//   The memory job now hands the extraction prompt from Settings to the
-//   extractor: effectiveMemoryPrompt(settings) = the prompt the user edited
-//   in the "Memory Prompt Editor" card, or the built-in one when none was
-//   edited. This is what lets the user tune the prompt by trial and error
-//   on the phone, without rebuilding the app. (The change takes effect
-//   after Save & Reload in Settings.)
+// PHASE 4, STEP 7 (marked "STEP 7"):
+//   A) THE EDITED MEMORY PROMPT. The memory job hands the extraction prompt
+//      from Settings to the extractor: effectiveMemoryPrompt(settings) = the
+//      prompt the user edited in the "Memory Prompt Editor" card, or the
+//      built-in one when none was edited. (It takes effect after
+//      Save & Reload in Settings.)
+//   B) SEARCH VECTORS. When heavy search is ON and the embedder file is
+//      chosen, the memory job has a SECOND part right after the extraction
+//      (MemoryIndexer): the memories that have tags but no vector yet get
+//      one. For that Gemma is unloaded, the embedder is loaded, the texts
+//      are embedded and Gemma is loaded again. The dialog says "Making
+//      search vectors..." (MemoryJobUi.indexing). Rules:
+//        - It runs even when the extraction found nothing new, because
+//          memories can be waiting for a vector (edited ones, or a run that
+//          was cancelled). When there is nothing to do, no model is swapped.
+//        - It is best effort: if it fails, the memories are still saved,
+//          the dialog says so, and the delete flow still deletes the chat
+//          (the vectors are simply made next time).
+//        - If the user cancels DURING this part, the chat is NOT deleted
+//          (cancel always means "do not delete").
 //
 // STILL TEMPORARY:
-//   - Heavy search (embedder + reranker) is not wired here yet.
+//   - The deep search tool (heavy search while chatting) is not wired here
+//     yet; only the vectors are made.
 //
 // IDS: messages shown on screen need a unique id for the list. Messages
 //   loaded from the database keep their database id (positive numbers).
@@ -113,9 +127,12 @@ import com.haven.chat.data.ChatSummary
 import com.haven.chat.data.MemoryRepository
 import com.haven.chat.data.Role
 import com.haven.chat.engine.EngineManager
+import com.haven.chat.engine.IndexResult
 import com.haven.chat.engine.MemoryExtractor
+import com.haven.chat.engine.MemoryIndexer
 import com.haven.chat.engine.MemoryJobResult
 import com.haven.chat.engine.MemorySearch
+import com.haven.chat.ui.settings.AppSettings
 import com.haven.chat.ui.settings.SettingsViewModel
 import com.haven.chat.ui.settings.effectiveMemoryPrompt
 import kotlinx.coroutines.CancellationException
@@ -127,23 +144,28 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.io.File
 
 // ---------------------------------------------------------------------
 // PHASE 4 (NEW): what the memory dialog shows.
 //   running  true = Gemma is working (show progress and a Cancel button)
 //            false = the job is over (show "message" and an OK button)
-//   checked / total  how many of the user's messages are checked so far,
-//            out of how many. total = 0 means "not known yet" (the first
-//            batch is still being read).
+//   checked / total  how many things are done so far, out of how many.
+//            While indexing = false these are the user's MESSAGES that were
+//            checked; while indexing = true they are the search VECTORS
+//            made. total = 0 means "not known yet".
 //   saved    how many memories were saved so far
 //   message  the result text, only when running = false
+//   indexing STEP 7: true while the SEARCH VECTORS are being made (the second
+//            part of the job). The dialog then says "Making search vectors..."
 // ---------------------------------------------------------------------
 class MemoryJobUi(
     val running: Boolean,
     val checked: Int = 0,
     val total: Int = 0,
     val saved: Int = 0,
-    val message: String? = null
+    val message: String? = null,
+    val indexing: Boolean = false
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -158,6 +180,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // PHASE 4: the job that finds the personal messages of a chat and
     // saves them (it uses the chat repository and the memory repository).
     private val extractor = MemoryExtractor(repo, memoryRepo)
+
+    // STEP 7: the job that makes the search vectors of the memories.
+    private val indexer = MemoryIndexer(memoryRepo)
 
     // ----- STATE (data the screen shows) -----
     // "mutableStateOf" = when this value changes, Compose redraws.
@@ -614,10 +639,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         startMemoryJob(chatId, deleteChatAfter = true)
     }
 
+    // STEP 7: is heavy search set up well enough to make search vectors?
+    // (The switch is ON and an embedder file is chosen. The file itself is
+    // checked again by MemoryIndexer.)
+    private fun canMakeVectors(s: AppSettings): Boolean =
+        s.heavySearch && s.embedderPath.isNotBlank() && File(s.embedderPath).exists()
+
     // PHASE 4: the memory job for one chat, used by BOTH actions above.
     //   deleteChatAfter = false : "remember" (just save the memories).
     //   deleteChatAfter = true  : "save, then delete": the chat is deleted
     //                             ONLY when the job is COMPLETE.
+    // STEP 7: when heavy search is ON, the job has a second part after the
+    // extraction: making the search vectors (see the notes at the top).
     // The result dialog (memoryJob) tells the user what happened.
     private fun startMemoryJob(chatId: Long, deleteChatAfter: Boolean) {
         working = true
@@ -626,6 +659,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             val ui: MemoryJobUi = try {
+                // ---- PART 1: find the personal messages and save them ----
                 val result = extractor.run(
                     chatId = chatId,
                     memoryThinking = s.memoryThinking,
@@ -649,6 +683,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     extractionPrompt = effectiveMemoryPrompt(s)
                 )
 
+                // ---- PART 2 (STEP 7): make the search vectors ----
+                // Only when part 1 is complete and heavy search is set up.
+                // Best effort: a problem here never undoes part 1.
+                var indexText = ""
+                var indexCancelled = false
+                if (result.completed && canMakeVectors(s)) {
+                    memoryJob = MemoryJobUi(running = true, saved = result.saved, indexing = true)
+                    val index = indexer.run(
+                        embedderPath = s.embedderPath,
+                        systemPrompt = SettingsViewModel.systemPromptOf(s),
+                        chatThinking = s.thinkingEnabled,
+                        restoreHistory = { historyForEngine(messages) },
+                        onProgress = { done, total ->
+                            memoryJob = MemoryJobUi(
+                                running = true,
+                                checked = done,
+                                total = total,
+                                saved = result.saved,
+                                indexing = true
+                            )
+                        }
+                    )
+                    indexText = indexMessage(index)
+                    indexCancelled = index.cancelled
+                }
+
                 when {
                     // Not complete (error, cancel, model not loaded...): the
                     // chat is NOT deleted, whatever was asked.
@@ -662,14 +722,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     // "Remember" only: nothing to delete.
                     !deleteChatAfter ->
-                        MemoryJobUi(running = false, saved = result.saved, message = memoryMessage(result))
+                        MemoryJobUi(
+                            running = false,
+                            saved = result.saved,
+                            message = memoryMessage(result) + indexText
+                        )
+
+                    // The user cancelled while the vectors were made: cancel
+                    // always means "do not delete".
+                    indexCancelled ->
+                        MemoryJobUi(
+                            running = false,
+                            saved = result.saved,
+                            message = memoryMessage(result) + indexText + NOT_DELETED_HINT
+                        )
 
                     // Complete AND delete wanted: delete now.
                     removeChat(chatId) ->
                         MemoryJobUi(
                             running = false,
                             saved = result.saved,
-                            message = deletedMessage(result.saved)
+                            message = deletedMessage(result.saved) + indexText
                         )
 
                     // The memories are saved, but the delete itself failed.
@@ -697,10 +770,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // PHASE 4: the dialog's Cancel button. The batch that Gemma is reading
-    // is interrupted; what earlier batches saved stays saved. (In the
-    // delete flow the chat is then NOT deleted.)
+    // (or, STEP 7, the vectors being made) is interrupted; what earlier
+    // batches saved stays saved. (In the delete flow the chat is then NOT
+    // deleted.) Both jobs are told; the one that is not running ignores it.
     fun cancelMemoryJob() {
         extractor.cancel()
+        indexer.cancel()
     }
 
     // PHASE 4: the dialog's OK button (only works when the job is over).
@@ -796,6 +871,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun deletedMessage(saved: Int): String =
         if (saved == 0) "No new personal things were found. The chat was deleted."
         else memoriesText(saved) + " saved. The chat was deleted."
+
+    // STEP 7: one extra line about the search vectors, added to the result
+    // text. Empty when there was nothing to say (no vectors were needed).
+    private fun indexMessage(r: IndexResult): String = when {
+        r.error != null -> "\nSearch vectors could not be made: " + r.error
+        r.cancelled -> "\nMaking the search vectors was cancelled."
+        r.made == 1 -> "\n1 search vector made."
+        r.made > 1 -> "\n" + r.made + " search vectors made."
+        else -> ""
+    }
 
     companion object {
         // PHASE 4: the typed phrase that starts the memory job.

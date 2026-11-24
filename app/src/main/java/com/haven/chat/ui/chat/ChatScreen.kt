@@ -50,6 +50,11 @@
 //      outside. When the job is over, the same dialog shows the short
 //      result text and an OK button. The ViewModel (ChatViewModel,
 //      memoryJob) decides what is shown; this screen only draws it.
+//   3) STEP 7: the job has a second part, MAKING THE SEARCH VECTORS (heavy
+//      search). While it runs (memoryJob.indexing), the dialog has the
+//      title "Making search vectors" and says how many are made, or, before
+//      the first one, that Gemma is being swapped for the search model (this
+//      can take a minute). The Cancel button works there too.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -336,6 +341,9 @@ fun ChatScreen(
     //   RUNNING  : progress text + progress bar + [Cancel]. Tapping outside
     //              or pressing Back does NOT close it (the job is running;
     //              only Cancel stops it).
+    //              STEP 7: the job has two parts. Part 1 (indexing = false)
+    //              checks the user's messages. Part 2 (indexing = true)
+    //              makes the search vectors; it has its own title and text.
     //   FINISHED : the result text + [OK]. Tapping outside counts as OK.
     // The numbers and texts come from ChatViewModel (memoryJob).
     if (memoryJob != null) {
@@ -343,24 +351,37 @@ fun ChatScreen(
         if (job.running) {
             AlertDialog(
                 onDismissRequest = { /* not closable while the job runs */ },
-                title = { Text("Saving personal memories") },
+                title = {
+                    Text(if (job.indexing) "Making search vectors" else "Saving personal memories")
+                },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         if (job.total > 0) {
-                            // We know how many messages there are: show the real progress.
+                            // We know how many there are: show the real progress.
                             Text(
-                                "Checked ${job.checked} of ${job.total} of your messages.\n" +
-                                        "${job.saved} saved so far."
+                                if (job.indexing) {
+                                    "Made ${job.checked} of ${job.total} search vectors.\n" +
+                                            "Gemma is loaded again at the end."
+                                } else {
+                                    "Checked ${job.checked} of ${job.total} of your messages.\n" +
+                                            "${job.saved} saved so far."
+                                }
                             )
                             LinearProgressIndicator(
                                 progress = { job.checked.toFloat() / job.total.toFloat() },
                                 modifier = Modifier.fillMaxWidth()
                             )
                         } else {
-                            // The first batch is still being read: no numbers yet.
+                            // No numbers yet: the first batch is being read, or
+                            // (indexing) Gemma is being swapped for the search model.
                             Text(
-                                "Gemma is reading your messages. " +
-                                        "The first step can take a minute."
+                                if (job.indexing) {
+                                    "Gemma is unloaded and the search model is loading. " +
+                                            "This can take a minute."
+                                } else {
+                                    "Gemma is reading your messages. " +
+                                            "The first step can take a minute."
+                                }
                             )
                             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         }

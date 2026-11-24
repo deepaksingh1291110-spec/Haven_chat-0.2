@@ -46,14 +46,12 @@
 //      conversation with the extraction prompt (MemoryPrompts.kt), sends
 //      the numbered list of user messages and reads Gemma's JSON reply.
 //      If the reply is not understood it tries ONE more time.
-//      The text Gemma writes is never saved anywhere: only the NUMBERS in
-//      it are used.
 //   4) finishMemorizing(): puts the open chat back into Gemma's head
 //      (like after a title) and sets the state back to READY.
 //   5) cancelMemorizing(): stops the running batch (same as stop()).
 //
 // PHASE 4, STEP 6 CHANGES (marked "STEP 6"): LIGHT SEARCH (a TOOL for Gemma).
-//   generate() can now give Gemma ONE tool (a ToolRunner, here: the memory
+//   generate() can give Gemma a TOOL (a ToolRunner, here: the memory
 //   search_memory tool, see MemorySearch.kt). How a normal answer goes:
 //     1) The tool is registered, Gemma reads the question and writes the
 //        answer. Nothing else happens. (Most answers.)
@@ -61,31 +59,48 @@
 //        for a CALL with arguments. Then the engine:
 //          - tells the screen to start the bubble again (onRestart), because
 //            what was streamed so far was only the lead-in to the call,
-//          - runs the tool (tool.run, still on the worker thread) and gives
-//            the result text back to Gemma (addToolResult),
+//          - runs the tool (still on the worker thread) and gives the result
+//            text back to Gemma (addToolResult),
 //          - asks Gemma to continue (generate with an empty text). Gemma
 //            now reads the result and writes the real answer.
-//        Gemma may ask for the tool a second time (to narrow the search).
-//        At most MAX_TOOL_ROUNDS calls are served per answer; if Gemma still
-//        asks after that, the answer ends with a plain-words problem text.
-//   - The tool is registered ONLY for this call and removed afterwards
+//        Gemma may ask for a tool again (to narrow the search). At most
+//        MAX_TOOL_ROUNDS calls are served per answer; if Gemma still asks
+//        after that, the answer ends with a plain-words problem text.
+//   - The tools are registered ONLY for this call and removed afterwards
 //     (also after errors), so the other jobs (title, memory extraction)
-//     never see it.
-//   - searchingMemory (Compose state) is true while the tool runs; the chip
+//     never see them.
+//   - searchingMemory (Compose state) is true while a tool runs; the chip
 //     then says "Searching memories...".
-//   - generate() has two new parameters with default values, so older
-//     calls still work: tool (null = no tool) and onRestart.
 //
-// PHASE 4, STEP 7 CHANGES (marked "STEP 7"): TAGS FOR EVERY PERSONAL MESSAGE.
-//   - classifyBatch() now gets TAGS from Gemma, not only the numbers. Its
-//     BatchResult has "items": for every personal message its number and its
-//     4 to 6 tags (MemoryPrompts.PersonalItem). The old "personal" list of
-//     numbers is still there (it is taken from the items).
-//   - classifyBatch() has a new parameter "prompt": the extraction system
-//     prompt to use. The caller passes the one from Settings (the user can
-//     edit it there to tune it). It has a default value, so older calls
-//     still work and use the built-in prompt.
-//   Everything else works as before.
+// PHASE 4, STEP 7 CHANGES (marked "STEP 7"):
+//   A) TAGS: classifyBatch() returns the tags Gemma wrote (BatchResult.items)
+//      and takes the extraction prompt as a parameter (the user can edit it
+//      in Settings).
+//   B) MODEL SWAP FOR HEAVY SEARCH. The engine holds ONE model at a time (RAM).
+//      To use the two search models (embedder bge-m3, reranker
+//      bge-reranker-v2-m3) Gemma must be UNLOADED first and loaded AGAIN
+//      afterwards. What the engine now offers:
+//        - the engine remembers how Gemma was loaded (path, context,
+//          threads): loadedPath / loadedContext / loadedThreads,
+//        - class SearchSwap: the handle that a deep search tool gets. It
+//          frees Gemma, loads the embedder or the reranker (one at a time),
+//          embeds a text or scores a document, and when it is closed it
+//          loads Gemma AGAIN. The conversation (what the chat said so far,
+//          including Gemma's tool call) is KEPT by the C++ engine while the
+//          model is out; only the model's memory of it (the KV cache) is
+//          lost, so Gemma reads the conversation again afterwards.
+//        - ToolRunner.runDeep: a tool that needs the swap (the light tool
+//          keeps using "run").
+//        - generate(tools = ...): several tools at once (for example the
+//          light search AND the deep search). Gemma picks one by name.
+//        - embedTexts(): the same swap for MAKING VECTORS after memories were
+//          saved (state MEMORIZING): frees Gemma, loads the embedder, embeds
+//          the texts, loads Gemma again.
+//      If Gemma cannot be loaded again (for example not enough RAM), the
+//      engine goes to State.ERROR with a plain-words text; tapping the chip
+//      loads the model again.
+//      While Gemma is out, exact token counting is not possible; a safe
+//      guess (1 token per 3 characters) is used (see tokensOf).
 // =====================================================================
 package com.haven.chat.engine
 
@@ -141,7 +156,7 @@ object EngineManager {
     var thinkingSeen by mutableStateOf(false)
         private set
 
-    // STEP 6: true while the memory search tool is running (between Gemma's
+    // STEP 6: true while a memory search tool is running (between Gemma's
     // call and the result going back). The chip then says "Searching memories...".
     var searchingMemory by mutableStateOf(false)
         private set
@@ -226,27 +241,155 @@ object EngineManager {
     }
 
     // -----------------------------------------------------------------
-    // STEP 6: a tool that Gemma may call during generate()
+    // STEP 7: result of embedTexts()
+    // -----------------------------------------------------------------
+    /**
+     * vectors   one vector per text, in the same order, when ALL texts were
+     *           embedded. null when the job did not finish (see below).
+     * cancelled true if the user cancelled.
+     * error     a plain-words problem, or null. (Also used when Gemma could
+     *           not be loaded again: then the engine state is ERROR.)
+     *
+     * Vectors are only handed over when the whole job worked, so the caller
+     * never saves half a batch.
+     */
+    class EmbedResult(
+        val vectors: List<FloatArray>?,
+        val cancelled: Boolean,
+        val error: String?
+    )
+
+    // -----------------------------------------------------------------
+    // STEP 7: the model swap handle (used by deep search and embedTexts)
+    // -----------------------------------------------------------------
+    /**
+     * The handle that a deep search gets for the time of ONE tool call. It
+     * lives ONLY on the engine's worker thread and ONLY while the tool runs.
+     *
+     * What it does, in order:
+     *   1) useEmbedder(path) / useReranker(path): frees Gemma (the first
+     *      time), frees the other search model if one is loaded, and loads
+     *      the one asked for. Only ONE model is in RAM at any time.
+     *      Returns null when it worked, or a plain-words problem text.
+     *   2) embed(text) / rerank(query, document): use the loaded search model.
+     *   3) When the tool returns, EngineManager closes the swap: the search
+     *      model is freed and Gemma is loaded AGAIN (the conversation is
+     *      still there; see the notes at the top of this file).
+     * The tool never has to load or free Gemma itself.
+     */
+    class SearchSwap internal constructor(
+        private val b: LlamaBridge,
+        private val threads: Int,
+        private val reloadMain: () -> String?
+    ) {
+        // Gemma has been freed by this swap (so it must be loaded again).
+        private var mainFreed = false
+
+        // A search model is loaded right now.
+        private var auxLoaded = false
+
+        // Frees what is loaded and loads the search model [path] of this [kind]
+        // (LlamaBridge.KIND_EMBEDDER or KIND_RERANKER). Returns null = ok.
+        private fun loadAux(path: String, kind: Int): String? {
+            if (!mainFreed) {
+                b.unload()                      // frees Gemma, KEEPS the conversation
+                mainFreed = true
+            }
+            if (auxLoaded) {
+                b.unloadAux()
+                auxLoaded = false
+            }
+            if (path.isBlank() || !File(path).exists()) {
+                return "Search model file not found: $path"
+            }
+            return when (val rc = b.loadAux(path, kind, threads)) {
+                0 -> {
+                    auxLoaded = true
+                    null
+                }
+                1 -> "The search model file could not be loaded (wrong file or not enough RAM)."
+                2 -> "The search model loaded but its context could not be created."
+                3 -> "Unknown search model kind."
+                4 -> "Gemma is still loaded, so the search model could not be loaded."
+                else -> "Loading the search model failed (code $rc)."
+            }
+        }
+
+        /** Loads the embedder (bge-m3), freeing Gemma first. null = ok, else the problem. */
+        fun useEmbedder(path: String): String? = loadAux(path, LlamaBridge.KIND_EMBEDDER)
+
+        /** Loads the reranker, freeing Gemma or the embedder first. null = ok, else the problem. */
+        fun useReranker(path: String): String? = loadAux(path, LlamaBridge.KIND_RERANKER)
+
+        /**
+         * The vector of [text] (normalized, 1024 numbers for bge-m3), or null
+         * when no embedder is loaded or the text could not be embedded.
+         */
+        fun embed(text: String): FloatArray? {
+            if (!auxLoaded) return null
+            return b.embed(text.toByteArray(Charsets.UTF_8))
+        }
+
+        /**
+         * How relevant [document] is for [query] (higher = more relevant), or
+         * null when no reranker is loaded or the pair could not be scored.
+         */
+        fun rerank(query: String, document: String): Float? {
+            if (!auxLoaded) return null
+            val score = b.rerankScore(query.toByteArray(Charsets.UTF_8), document.toByteArray(Charsets.UTF_8))
+            return if (score <= -1e5f) null else score      // -1e6 is the engine's "error"
+        }
+
+        // Called by EngineManager when the tool is done: frees the search
+        // model and loads Gemma again. Returns null = ok, or the problem.
+        internal fun close(): String? {
+            if (auxLoaded) {
+                try {
+                    b.unloadAux()
+                } catch (t: Throwable) {
+                    // nothing to do
+                }
+                auxLoaded = false
+            }
+            if (!mainFreed) return null
+            mainFreed = false
+            return reloadMain()
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // STEP 6 / STEP 7: a tool that Gemma may call during generate()
     // -----------------------------------------------------------------
     /**
      * name, description, parametersJson  what Gemma reads about the tool
-     *     (the parameters are a JSON schema). For the memory search see
+     *     (the parameters are a JSON schema). For the light search see
      *     MemorySearch.kt.
-     * run  does the work when Gemma calls the tool. It is called ON THE
-     *     WORKER THREAD (so it may block for a moment, but must not touch
-     *     the screen). It gets:
+     * run  (light tools) does the work when Gemma calls the tool. It is
+     *     called ON THE WORKER THREAD (so it may block for a moment, but
+     *     must not touch the screen). It gets:
      *       argsJson     the arguments of the call, as JSON text
      *       tokenBudget  how many tokens the result text may use
-     *       countTokens  counts the tokens of a text exactly (Gemma's tokenizer)
+     *       countTokens  counts the tokens of a text (exact with Gemma's
+     *                    tokenizer; a safe guess while Gemma is unloaded)
      *     and returns the result text that Gemma reads. It should never
      *     throw; if it does, Gemma is told that the tool failed.
+     * runDeep  STEP 7: for a tool that needs the search models. The same,
+     *     plus a SearchSwap (see above): Gemma is unloaded while the tool
+     *     uses the swap, and loaded again afterwards. If a tool has runDeep,
+     *     it is used and "run" is ignored.
+     * A tool must have run or runDeep.
      */
     class ToolRunner(
         val name: String,
         val description: String,
         val parametersJson: String,
-        val run: (argsJson: String, tokenBudget: Int, countTokens: (String) -> Int) -> String
+        val run: ((argsJson: String, tokenBudget: Int, countTokens: (String) -> Int) -> String)? = null,
+        val runDeep: ((argsJson: String, tokenBudget: Int, countTokens: (String) -> Int, swap: SearchSwap) -> String)? = null
     )
+
+    // What running one tool gave: the text for Gemma, and a problem text if
+    // Gemma could not be loaded again afterwards.
+    private class ToolOutcome(val text: String, val reloadError: String?)
 
     // -----------------------------------------------------------------
     // PHASE 3: numbers used when an old chat is put back into Gemma
@@ -303,6 +446,11 @@ object EngineManager {
     // PHASE 3: the context size the model was loaded with (0 = nothing loaded).
     @Volatile private var loadedContext = 0
 
+    // STEP 7: how Gemma was loaded, so it can be loaded AGAIN after a model
+    // swap. (loadedContext is above.)
+    @Volatile private var loadedPath = ""
+    @Volatile private var loadedThreads = 4
+
     // Run something on the main thread (now if we are already there).
     private fun onMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
@@ -358,6 +506,9 @@ object EngineManager {
      * until the context is full. "thinking" only decides how much room is
      * kept for the reply (1000 tokens with thinking, 500 without).
      * It has a default value, so older calls without it still work.
+     *
+     * STEP 7: the path and the thread count are remembered, so Gemma can be
+     * loaded again after a model swap.
      */
     fun load(
         path: String,
@@ -422,6 +573,8 @@ object EngineManager {
                     onMain { onDone(msg.trim()) }
                 } else {
                     loadedContext = contextSize
+                    loadedPath = path                 // STEP 7: remembered for a reload
+                    loadedThreads = threads           // STEP 7
                     // Start the conversation with the system prompt, and
                     // (PHASE 3) put the open chat back, as much as fits.
                     replayOnWorker(b, systemPrompt, history, thinking)
@@ -532,11 +685,64 @@ object EngineManager {
     }
 
     // Exact token count of a text (Gemma's own tokenizer). If the engine
-    // says "no model" (-1), use a safe guess: 1 token per 3 characters.
+    // says "no model" (-1, for example while Gemma is unloaded for a model
+    // swap), use a safe guess: 1 token per 3 characters.
     private fun tokensOf(b: LlamaBridge, text: String): Int {
         if (text.isEmpty()) return 0
         val n = b.countTokens(text.toByteArray(Charsets.UTF_8))
         return if (n >= 0) n else text.length / 3 + 1
+    }
+
+    // STEP 7: loads Gemma AGAIN after a model swap, with the same path,
+    // context and threads as before. Runs ON THE WORKER THREAD.
+    // The C++ engine kept the conversation while the model was out, so
+    // nothing else has to be put back. Returns null = ok, or a plain-words
+    // problem text.
+    private fun reloadMainOnWorker(b: LlamaBridge): String? {
+        return try {
+            val rc = b.loadModel(loadedPath, loadedContext, loadedThreads)
+            if (rc == 0) {
+                null
+            } else {
+                "Gemma could not be loaded again after the search (code $rc). " +
+                        b.lastLog().takeLast(150).trim()
+            }
+        } catch (t: Throwable) {
+            "Gemma could not be loaded again after the search: " + (t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    // STEP 7: runs ONE tool call. Runs ON THE WORKER THREAD.
+    // A light tool just runs. A deep tool gets a SearchSwap, and after it
+    // returns the swap is closed: the search model is freed and Gemma is
+    // loaded again (reloadError tells if that failed).
+    private fun runToolOnWorker(
+        b: LlamaBridge,
+        runner: ToolRunner,
+        argsJson: String,
+        tokenBudget: Int
+    ): ToolOutcome {
+        val counter: (String) -> Int = { text -> tokensOf(b, text) }
+
+        val deep = runner.runDeep
+        if (deep != null) {
+            val swap = SearchSwap(b, loadedThreads) { reloadMainOnWorker(b) }
+            val text = try {
+                deep(argsJson, tokenBudget, counter, swap)
+            } catch (t: Throwable) {
+                "The deep search failed. Tell the user you could not look."
+            }
+            val reloadError = swap.close()
+            return ToolOutcome(text, reloadError)
+        }
+
+        val light = runner.run
+        val text = try {
+            if (light != null) light(argsJson, tokenBudget, counter) else "This tool cannot run."
+        } catch (t: Throwable) {
+            "The search failed. Tell the user you could not look."
+        }
+        return ToolOutcome(text, null)
     }
 
     // -----------------------------------------------------------------
@@ -546,13 +752,14 @@ object EngineManager {
      * onThinking / onAnswer get small pieces of text while Gemma writes
      * (on the main thread). onDone runs once at the end with the full Result.
      *
-     * STEP 6 (both new parameters have default values):
-     *   tool       a tool Gemma may call during this answer (the memory
-     *              search), or null for none. See the notes at the top.
-     *   onRestart  called (main thread) when Gemma has asked for the tool
-     *              and the answer starts again after the tool result. The
-     *              caller should throw away the thinking and answer pieces
-     *              it collected so far: they were only the lead-in to the
+     * STEP 6 / STEP 7 (the new parameters have default values):
+     *   tool       a tool Gemma may call during this answer, or null for none.
+     *   tools      STEP 7: more tools (for example the deep search) next to
+     *              [tool]. Gemma picks one by its name.
+     *   onRestart  called (main thread) when Gemma has asked for a tool and
+     *              the answer starts again after the tool result. The caller
+     *              should throw away the thinking and answer pieces it
+     *              collected so far: they were only the lead-in to the
      *              call. The final texts come in the Result.
      */
     fun generate(
@@ -563,7 +770,8 @@ object EngineManager {
         onAnswer: (String) -> Unit,
         onDone: (Result) -> Unit,
         tool: ToolRunner? = null,
-        onRestart: () -> Unit = {}
+        onRestart: () -> Unit = {},
+        tools: List<ToolRunner> = emptyList()
     ) {
         if (state != State.READY) {
             val msg = when (state) {
@@ -609,15 +817,20 @@ object EngineManager {
                 }
             }
 
+            // STEP 7: all the tools of this answer, and a problem text if
+            // Gemma could not be loaded again after a deep search.
+            val allTools = listOfNotNull(tool) + tools
+            var swapFailure: String? = null
+
             val result: Result = try {
-                // STEP 6: the tool is registered only for this answer. First
+                // STEP 6: the tools are registered only for this answer. First
                 // remove anything left over (the tool list is global in C++).
                 b.clearTools()
-                if (tool != null) {
+                for (t in allTools) {
                     b.addTool(
-                        tool.name,
-                        tool.description.toByteArray(Charsets.UTF_8),
-                        tool.parametersJson.toByteArray(Charsets.UTF_8)
+                        t.name,
+                        t.description.toByteArray(Charsets.UTF_8),
+                        t.parametersJson.toByteArray(Charsets.UTF_8)
                     )
                 }
 
@@ -629,7 +842,7 @@ object EngineManager {
                 var rounds = 0
                 var gaveUp = false
                 while (true) {
-                    if (tool == null || stopRequested ||
+                    if (allTools.isEmpty() || stopRequested ||
                         stats.startsWith("ERROR") || stats.startsWith("STOPPED")
                     ) break
 
@@ -654,22 +867,37 @@ object EngineManager {
 
                     val budget = MemorySearch.tokenBudget(loadedContext)
                     for (call in calls) {
-                        val text = try {
-                            tool.run(call.argumentsJson, budget) { t -> tokensOf(b, t) }
-                        } catch (t: Throwable) {
-                            "The search failed. Tell the user you could not look."
+                        val runner = allTools.firstOrNull { it.name == call.name }
+                        val text: String
+                        if (runner == null) {
+                            text = "There is no tool with this name. Answer without it."
+                        } else {
+                            // STEP 7: a deep tool frees Gemma and loads it again.
+                            val outcome = runToolOnWorker(b, runner, call.argumentsJson, budget)
+                            text = outcome.text
+                            if (outcome.reloadError != null) swapFailure = outcome.reloadError
                         }
-                        b.addToolResult(call.id, call.name, text.toByteArray(Charsets.UTF_8))
+                        // If Gemma could not be loaded again, there is no one
+                        // to give the result to.
+                        if (swapFailure == null) {
+                            b.addToolResult(call.id, call.name, text.toByteArray(Charsets.UTF_8))
+                        }
                     }
 
                     onMain { searchingMemory = false }
 
+                    if (swapFailure != null) break
+
                     // An EMPTY text: nothing new is added, Gemma reads the tool
-                    // result and continues.
+                    // result and continues. (After a deep search Gemma reads
+                    // the whole conversation again: its KV cache was lost.)
                     stats = b.generate(ByteArray(0), maxNewTokens, thinking, listener)
                 }
 
+                val failure = swapFailure
                 when {
+                    failure != null ->
+                        Result("", "", null, null, false, failure)
                     stats.startsWith("ERROR") ->
                         Result("", "", null, null, false, stats.removePrefix("ERROR:").trim())
                     stats.startsWith("STOPPED") ->
@@ -697,14 +925,18 @@ object EngineManager {
                 Result("", "", null, null, false, "Generation failed: " + (t.message ?: t.javaClass.simpleName))
             }
 
-            // STEP 6: take the tool away again, so the other jobs never see it.
+            // STEP 6: take the tools away again, so the other jobs never see them.
+            // (Harmless if Gemma is not loaded.)
             try {
                 b.clearTools()
             } catch (t: Throwable) {
                 // nothing to do
             }
 
-            setState(State.READY)
+            // STEP 7: if Gemma could not be loaded again, the engine is in
+            // ERROR (tapping the chip loads it again); otherwise READY.
+            val failureText = swapFailure
+            if (failureText != null) setState(State.ERROR, failureText) else setState(State.READY)
             onMain { onDone(result) }
         }
     }
@@ -817,6 +1049,8 @@ object EngineManager {
     //   startMemorizing()      once, at the start  (READY -> MEMORIZING)
     //   classifyBatch(...)     once per batch of up to 5 user messages
     //   finishMemorizing(...)  once, at the end    (MEMORIZING -> READY)
+    // STEP 7: between the last batch and finishMemorizing(), embedTexts()
+    // may run (making the search vectors of the new memories).
     // The state stays MEMORIZING the whole time, so the rest of the app
     // sees the engine as busy (no sending, opening or deleting meanwhile).
     // The caller MUST always call finishMemorizing(), also after an error
@@ -924,6 +1158,84 @@ object EngineManager {
             }
 
             onMain { onDone(result) }
+        }
+    }
+
+    /**
+     * STEP 7: makes the search vectors of [texts] with the embedder model.
+     * Call it while the state is MEMORIZING (after the batches, before
+     * finishMemorizing). What it does, on the worker thread:
+     *   1) frees Gemma and loads the embedder ([embedderPath]),
+     *   2) embeds the texts one by one (the user can cancel between two),
+     *   3) frees the embedder and loads Gemma AGAIN.
+     *   embedderPath  the bge-m3 GGUF file (from Settings)
+     *   texts         what to embed, one text per memory
+     *   onProgress    called on the main thread after each text with how many
+     *                 are done so far
+     *   onDone        called on the main thread with an EmbedResult. The
+     *                 vectors come back only when ALL texts were embedded.
+     *
+     * If Gemma cannot be loaded again, the engine state becomes ERROR and
+     * the result has an error text.
+     */
+    fun embedTexts(
+        embedderPath: String,
+        texts: List<String>,
+        onProgress: (Int) -> Unit,
+        onDone: (EmbedResult) -> Unit
+    ) {
+        if (state != State.MEMORIZING) {
+            onDone(EmbedResult(null, false, "The memory job was not started."))
+            return
+        }
+        if (texts.isEmpty()) {
+            onDone(EmbedResult(emptyList(), false, null))
+            return
+        }
+
+        worker.execute {
+            val b = bridge
+            if (b == null) {
+                onMain { onDone(EmbedResult(null, false, "The engine is not started.")) }
+                return@execute
+            }
+
+            val swap = SearchSwap(b, loadedThreads) { reloadMainOnWorker(b) }
+            val vectors = ArrayList<FloatArray>()
+            var error: String? = null
+            var cancelled = false
+
+            try {
+                error = swap.useEmbedder(embedderPath)
+                if (error == null) {
+                    for ((index, text) in texts.withIndex()) {
+                        if (stopRequested) {
+                            cancelled = true
+                            break
+                        }
+                        val vector = swap.embed(text)
+                        if (vector == null) {
+                            error = "The embedding model could not read one of the memories."
+                            break
+                        }
+                        vectors.add(vector)
+                        onMain { onProgress(index + 1) }
+                    }
+                }
+            } catch (t: Throwable) {
+                error = "Making the search vectors failed: " + (t.message ?: t.javaClass.simpleName)
+            }
+
+            // ALWAYS: free the embedder and load Gemma again.
+            val reloadError = swap.close()
+            if (reloadError != null) {
+                setState(State.ERROR, reloadError)
+                onMain { onDone(EmbedResult(null, cancelled, reloadError)) }
+                return@execute
+            }
+
+            val ok = error == null && !cancelled
+            onMain { onDone(EmbedResult(if (ok) vectors else null, cancelled, error)) }
         }
     }
 
