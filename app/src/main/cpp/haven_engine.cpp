@@ -1,18 +1,44 @@
 // haven_engine.cpp - llama.cpp engine for Haven Chat (CPU only).
 //
 // Main model (Gemma): load one GGUF model, chat with it (streaming), choose CPU threads.
-// Search models (phases 2b and 2c): bge-m3 embeddings and the reranker, loaded one at a
+// Search models (heavy search): bge-m3 embeddings and the reranker, loaded one at a
 // time and only while the main model is unloaded (RAM).
 //
 // All functions are called from ONE background thread in Kotlin, except
 // stop(), which only sets a flag.
 //
-// PHASE 3 CHANGE (the only change in this file):
+// PHASE 3 CHANGE:
 //   New function countTokens(text) near the end of the "Chat" part.
 //   It tells Kotlin EXACTLY how many tokens a text has for the loaded
 //   main model (Gemma). The app uses it to decide how many old messages
 //   fit into the context window when an old chat is opened.
-//   Nothing else in this file was changed.
+//
+// STEP 7 CHANGE: OVERLAPPED LOADING ("prefetch"). Marked "STEP 7".
+//   Loading a model from the phone's storage takes time, and during that time the
+//   CPU mostly waits. The idea: while one model WORKS, the next model is
+//   loaded by a second (background) thread, so the waiting overlaps with work.
+//     - prefetchAux(path, kind, threads)  starts loading a search model
+//                                         (embedder 1 / reranker 2) in the background.
+//     - finishAux()                       waits until it is loaded, frees the search
+//                                         model that was active, and makes the new one
+//                                         the active one.
+//     - prefetchMain(path, nCtx, threads) starts loading the MAIN model (Gemma) in the
+//                                         background.
+//     - finishMain()                      waits until it is loaded and makes it the
+//                                         main model again. The conversation (g_msgs)
+//                                         and the tools were kept while it was away.
+//   The background thread also runs one tiny "warm-up" decode after loading. The
+//   model file is memory-mapped, so without it the file would only be read at
+//   the first real use (the first question), and the waiting would NOT be hidden.
+//   The background thread NEVER touches the active model or any global state:
+//   it only fills the "pending" slot (g_pf). Everything else (finish...,
+//   unload, loadModel) is called from the one worker thread in Kotlin, as before.
+//   RAM: at most TWO models are in RAM at the same time (the active search model
+//   plus the one being loaded). The old rule stays: a search model can only be
+//   loaded while the main model is NOT loaded.
+//   Also changed: g_last_level is atomic now (the log callback can run on two
+//   threads), loadModel() and unload() throw away a pending prefetch, and the
+//   sampler/template setup moved into init_main_state() so finishMain() can use it.
 
 #include <android/log.h>
 #include <jni.h>
@@ -26,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "llama.h"
@@ -62,19 +89,22 @@ static int                          g_n_ctx = 0;
 // Last warnings/errors from llama.cpp, so the app can show them on screen.
 static std::mutex       g_log_mu;
 static std::string      g_log_buf;
-static ggml_log_level   g_last_level = GGML_LOG_LEVEL_INFO;
+// STEP 7: atomic, because the log callback can now be called from two threads
+// (the worker thread and the prefetch thread). It holds a ggml_log_level.
+static std::atomic<int> g_last_level{(int) GGML_LOG_LEVEL_INFO};
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (!text) { return; }
-    if (level != GGML_LOG_LEVEL_CONT) { g_last_level = level; }
+    if (level != GGML_LOG_LEVEL_CONT) { g_last_level.store((int) level); }
+    const int lvl = g_last_level.load();
 
     int prio = ANDROID_LOG_INFO;
-    if (g_last_level == GGML_LOG_LEVEL_ERROR) { prio = ANDROID_LOG_ERROR; }
-    else if (g_last_level == GGML_LOG_LEVEL_WARN) { prio = ANDROID_LOG_WARN; }
-    else if (g_last_level == GGML_LOG_LEVEL_DEBUG) { prio = ANDROID_LOG_DEBUG; }
+    if (lvl == (int) GGML_LOG_LEVEL_ERROR) { prio = ANDROID_LOG_ERROR; }
+    else if (lvl == (int) GGML_LOG_LEVEL_WARN) { prio = ANDROID_LOG_WARN; }
+    else if (lvl == (int) GGML_LOG_LEVEL_DEBUG) { prio = ANDROID_LOG_DEBUG; }
     __android_log_print(prio, TAG, "%s", text);
 
-    if (g_last_level == GGML_LOG_LEVEL_ERROR || g_last_level == GGML_LOG_LEVEL_WARN) {
+    if (lvl == (int) GGML_LOG_LEVEL_ERROR || lvl == (int) GGML_LOG_LEVEL_WARN) {
         std::lock_guard<std::mutex> lock(g_log_mu);
         g_log_buf += text;
         if (g_log_buf.size() > 6000) {
@@ -197,6 +227,21 @@ static void free_all() {
     g_n_ctx = 0;
 }
 
+// STEP 7: the sampler and the chat templates of the main model. Used by loadModel()
+// and by finishMain() (a main model that was loaded in the background). Needs
+// g_model to be set.
+static void init_main_state() {
+    llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    g_smpl = llama_sampler_chain_init(sparams);
+    llama_sampler_chain_add(g_smpl, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(g_smpl, llama_sampler_init_top_p(0.95f, 1));
+    llama_sampler_chain_add(g_smpl, llama_sampler_init_temp(0.3f));
+    llama_sampler_chain_add(g_smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    g_tmpls = common_chat_templates_init(g_model, "");
+    g_cached.clear();
+}
+
 // Decodes tokens[from..] in chunks. g_cached must hold exactly tokens[0..from).
 // Returns 0 = ok, 1 = stopped by the user, 2 = error.
 static int decode_chunked(const std::vector<llama_token> & tokens, size_t from) {
@@ -231,6 +276,125 @@ static void free_aux() {
     if (g_aux_model) { llama_model_free(g_aux_model); g_aux_model = nullptr; }
     g_aux_kind  = 0;
     g_aux_n_ctx = 0;
+}
+
+// ---------------------------------------------------------------------------
+// STEP 7: loading a model in the BACKGROUND ("prefetch")
+// ---------------------------------------------------------------------------
+// One pending slot. While a prefetch thread runs, ONLY that thread writes
+// model / ctx / n_ctx / rc, and the JNI thread does not read them until it has
+// joined the thread (join = a safe hand-over). "active" and the other fields
+// are only touched by the JNI thread.
+struct Prefetch {
+    std::thread     worker;
+    bool            active  = false;   // a thread was started and not joined yet
+    int             kind    = 0;       // 1 = embedder, 2 = reranker, 3 = main model
+    int             rc      = -1;      // result: 0 ok, 1 = file failed, 2 = context failed
+    llama_model *   model   = nullptr; // the loaded model (valid when rc == 0 and joined)
+    llama_context * ctx     = nullptr;
+    int             n_ctx   = 0;       // the context size really created
+    int             threads = 4;       // the thread count the caller wants at the end
+};
+static Prefetch g_pf;
+
+// While loading in the background only a few threads are used for the warm-up,
+// so the model that is WORKING at the same time is not slowed down much. The
+// thread count the caller asked for is set when the model becomes active.
+static const int  PREFETCH_THREADS = 2;
+
+// Run one tiny decode after loading, so the whole model file is really read
+// from storage NOW (see the notes at the top). Set to false to skip it.
+static const bool PREFETCH_WARMUP  = true;
+
+// One-token decode, then clear what it wrote. Errors are ignored: a warm-up
+// that fails only means the file is read a little later.
+static void warm_up(llama_model * model, llama_context * ctx) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    llama_token tok = llama_vocab_bos(vocab);
+    if (tok == LLAMA_TOKEN_NULL) { tok = llama_vocab_eos(vocab); }
+    if (tok == LLAMA_TOKEN_NULL) { tok = 0; }
+
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.token[0]     = tok;
+    batch.pos[0]       = 0;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]    = true;
+    batch.n_tokens     = 1;
+    llama_decode(ctx, batch);
+    llama_batch_free(batch);
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (mem) { llama_memory_clear(mem, true); }
+}
+
+// The job of the prefetch thread. It must NOT touch any global except g_pf.
+//   kind 1 / 2: a search model (embedder / reranker), same settings as loadAux()
+//   kind 3    : the main model, same settings as loadModel(); n_ctx_req is its context size
+static void prefetch_job(std::string path, int kind, int n_ctx_req) {
+    try {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = 0;   // CPU only
+        llama_model * model = llama_model_load_from_file(path.c_str(), mparams);
+        if (!model) { g_pf.rc = 1; return; }
+
+        llama_context_params cparams = llama_context_default_params();
+        if (kind == 3) {
+            cparams.n_ctx    = (uint32_t) n_ctx_req;
+            cparams.n_batch  = 512;
+            cparams.n_ubatch = 512;
+        } else {
+            cparams.n_ctx      = 2048;
+            cparams.n_batch    = 2048;   // a whole text must fit into one batch
+            cparams.n_ubatch   = 2048;
+            cparams.embeddings = true;
+            if (kind == 2) { cparams.pooling_type = LLAMA_POOLING_TYPE_RANK; }
+        }
+        cparams.n_threads       = PREFETCH_THREADS;
+        cparams.n_threads_batch = PREFETCH_THREADS;
+
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        if (!ctx) {
+            llama_model_free(model);
+            g_pf.rc = 2;
+            return;
+        }
+
+        if (PREFETCH_WARMUP) { warm_up(model, ctx); }
+
+        g_pf.model = model;
+        g_pf.ctx   = ctx;
+        g_pf.n_ctx = (int) llama_n_ctx(ctx);
+        g_pf.rc    = 0;
+    } catch (const std::exception & e) {
+        LOGE("prefetch failed: %s", e.what());
+        g_pf.rc = 1;
+    } catch (...) {
+        LOGE("prefetch failed");
+        g_pf.rc = 1;
+    }
+}
+
+// Waits for the prefetch thread. Returns its result: 0 ok, 1 file failed,
+// 2 context failed, or 9 when nothing was started. After rc != 0 the pending
+// slot holds no model.
+static int pf_join() {
+    if (!g_pf.active) { return 9; }
+    if (g_pf.worker.joinable()) { g_pf.worker.join(); }
+    g_pf.active = false;
+    return g_pf.rc;
+}
+
+// Throws a pending prefetch away: waits for the thread and frees what it loaded.
+static void pf_discard() {
+    if (g_pf.active) {
+        if (g_pf.worker.joinable()) { g_pf.worker.join(); }
+        g_pf.active = false;
+    }
+    if (g_pf.ctx)   { llama_free(g_pf.ctx); g_pf.ctx = nullptr; }
+    if (g_pf.model) { llama_model_free(g_pf.model); g_pf.model = nullptr; }
+    g_pf.kind = 0;
+    g_pf.rc   = -1;
 }
 
 // Runs the search model over one token sequence (all tokens in sequence 0).
@@ -342,6 +506,7 @@ Java_com_haven_chat_LlamaBridge_init(JNIEnv * env, jobject, jstring native_lib_d
 // Returns 0 = ok, 1 = model file failed to load, 2 = context failed to create.
 JNIEXPORT jint JNICALL
 Java_com_haven_chat_LlamaBridge_loadModel(JNIEnv * env, jobject, jstring jpath, jint n_ctx, jint n_threads) {
+    pf_discard();     // STEP 7: a background load that nobody collected is thrown away
     free_all();
     {
         std::lock_guard<std::mutex> lock(g_log_mu);
@@ -369,15 +534,7 @@ Java_com_haven_chat_LlamaBridge_loadModel(JNIEnv * env, jobject, jstring jpath, 
     }
     g_n_ctx = (int) llama_n_ctx(g_ctx);
 
-    llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-    g_smpl = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(g_smpl, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(g_smpl, llama_sampler_init_top_p(0.95f, 1));
-    llama_sampler_chain_add(g_smpl, llama_sampler_init_temp(0.3f));
-    llama_sampler_chain_add(g_smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    g_tmpls = common_chat_templates_init(g_model, "");
-    g_cached.clear();
+    init_main_state();      // STEP 7: sampler + templates (the same code finishMain() uses)
     LOGI("model loaded, n_ctx = %d, threads = %d", g_n_ctx, threads);
     return 0;
 }
@@ -741,6 +898,7 @@ Java_com_haven_chat_LlamaBridge_stop(JNIEnv *, jobject) {
 
 JNIEXPORT void JNICALL
 Java_com_haven_chat_LlamaBridge_unload(JNIEnv *, jobject) {
+    pf_discard();     // STEP 7: a background load that nobody collected is thrown away
     free_all();
 }
 
@@ -786,7 +944,7 @@ JNIEXPORT jint JNICALL
 Java_com_haven_chat_LlamaBridge_loadAux(JNIEnv * env, jobject, jstring jpath, jint kind, jint n_threads) {
     if (g_model || g_ctx) { return 4; }
     if (kind != 1 && kind != 2) { return 3; }
-    free_aux();
+    free_aux();     // (a pending background load is NOT touched here on purpose)
     {
         std::lock_guard<std::mutex> lock(g_log_mu);
         g_log_buf.clear();
@@ -867,6 +1025,100 @@ Java_com_haven_chat_LlamaBridge_rerankScore(JNIEnv * env, jobject, jbyteArray jq
 JNIEXPORT void JNICALL
 Java_com_haven_chat_LlamaBridge_unloadAux(JNIEnv *, jobject) {
     free_aux();
+}
+
+// ---------------------------------------------------------------------------
+// STEP 7 (NEW): overlapped loading (JNI)
+// ---------------------------------------------------------------------------
+
+// Starts loading a SEARCH model in the background. kind: 1 = embedder, 2 = reranker.
+// Returns 0 = started, 3 = unknown kind, 4 = the main model is still loaded (RAM:
+// search models only load while it is away), 5 = a background load is already
+// running. The search model that is active now is NOT touched; finishAux() makes
+// the new one active.
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_prefetchAux(JNIEnv * env, jobject, jstring jpath, jint kind, jint n_threads) {
+    if (kind != 1 && kind != 2) { return 3; }
+    if (g_model || g_ctx) { return 4; }
+    if (g_pf.active) { return 5; }
+    pf_discard();                       // nothing should be left, but be sure
+
+    g_pf.kind    = (int) kind;
+    g_pf.rc      = -1;
+    g_pf.threads = std::max(1, std::min(16, (int) n_threads));
+    g_pf.active  = true;
+    g_pf.worker  = std::thread(prefetch_job, jstring_to_std(env, jpath), (int) kind, 0);
+    return 0;
+}
+
+// Waits until the background-loaded search model is ready, frees the search model that
+// was active, and makes the new one the active one.
+// Returns 0 = ok, 1 = file failed, 2 = context failed (in both cases the old search model
+// is still active), 8 = the pending model is not a search model, 9 = nothing was started.
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_finishAux(JNIEnv *, jobject) {
+    const int rc = pf_join();
+    if (rc != 0) { return rc; }
+    if (g_pf.kind != 1 && g_pf.kind != 2) {
+        pf_discard();
+        return 8;
+    }
+
+    free_aux();                         // the old search model goes now
+    g_aux_model = g_pf.model;
+    g_aux_ctx   = g_pf.ctx;
+    g_aux_kind  = g_pf.kind;
+    g_aux_n_ctx = g_pf.n_ctx;
+    g_pf.model  = nullptr;
+    g_pf.ctx    = nullptr;
+    g_pf.kind   = 0;
+    llama_set_n_threads(g_aux_ctx, g_pf.threads, g_pf.threads);
+    LOGI("search model ready from the background: kind %d, n_ctx %d", g_aux_kind, g_aux_n_ctx);
+    return 0;
+}
+
+// Starts loading the MAIN model (Gemma) in the background, with the given context size.
+// Returns 0 = started, 4 = the main model is already loaded, 5 = a background load is
+// already running. The conversation and the tools are kept, as with unload().
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_prefetchMain(JNIEnv * env, jobject, jstring jpath, jint n_ctx, jint n_threads) {
+    if (g_model || g_ctx) { return 4; }
+    if (g_pf.active) { return 5; }
+    pf_discard();
+
+    g_pf.kind    = 3;
+    g_pf.rc      = -1;
+    g_pf.threads = std::max(1, std::min(16, (int) n_threads));
+    g_pf.active  = true;
+    g_pf.worker  = std::thread(prefetch_job, jstring_to_std(env, jpath), 3, (int) n_ctx);
+    return 0;
+}
+
+// Waits until the background-loaded MAIN model is ready and makes it the main model.
+// The conversation and the tools were kept. The KV cache is empty (Gemma reads the
+// conversation again on the next generate()).
+// Returns 0 = ok, 1 = file failed, 2 = context failed, 8 = the pending model is not a
+// main model, 9 = nothing was started.
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_finishMain(JNIEnv *, jobject) {
+    const int rc = pf_join();
+    if (rc != 0) { return rc; }
+    if (g_pf.kind != 3) {
+        pf_discard();
+        return 8;
+    }
+
+    free_all();                         // normally nothing is loaded; keeps g_msgs and g_tools
+    g_model = g_pf.model;
+    g_ctx   = g_pf.ctx;
+    g_n_ctx = g_pf.n_ctx;
+    g_pf.model = nullptr;
+    g_pf.ctx   = nullptr;
+    g_pf.kind  = 0;
+    llama_set_n_threads(g_ctx, g_pf.threads, g_pf.threads);
+    init_main_state();
+    LOGI("main model ready from the background, n_ctx = %d, threads = %d", g_n_ctx, g_pf.threads);
+    return 0;
 }
 
 }  // extern "C"

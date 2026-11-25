@@ -22,11 +22,19 @@ data class ToolCall(val id: String, val name: String, val argumentsJson: String)
  * Create ONE instance and call everything from ONE background thread,
  * except stop(), which may be called from any thread.
  *
- * PHASE 3 CHANGE (the only change in this file):
+ * PHASE 3 CHANGE:
  *   New function countTokens(). It is the Kotlin side of the C++ function
  *   Java_com_haven_chat_LlamaBridge_countTokens that already exists in
  *   haven_engine.cpp. Without this line the C++ function can never be
- *   called. Nothing else in this file was changed.
+ *   called.
+ *
+ * STEP 7 CHANGE (marked "STEP 7"): OVERLAPPED LOADING.
+ *   Four new functions: prefetchAux, finishAux, prefetchMain, finishMain.
+ *   They are the Kotlin side of the C++ functions with the same names. A
+ *   "prefetch" starts loading a model on a background thread inside the
+ *   engine and returns at once; the matching "finish" waits until that model
+ *   is ready and makes it the active one. See the notes in haven_engine.cpp
+ *   and in the "overlapped loading" part below.
  */
 class LlamaBridge {
 
@@ -118,9 +126,11 @@ class LlamaBridge {
     }
 
     // ---------------------------------------------------------------- search models
-    // Only ONE search model is loaded at a time, and only while the main model is
+    // Only ONE search model is ACTIVE at a time, and only while the main model is
     // unloaded (RAM). Order: unload() -> loadAux(embedder) -> embed(...) -> unloadAux()
     //                        -> loadAux(reranker) -> rerankScore(...) -> unloadAux()
+    // STEP 7: with the overlapped loading below, the NEXT model can already be
+    // loading in the background while the active one works.
 
     /**
      * Loads a search model. kind: KIND_EMBEDDER or KIND_RERANKER.
@@ -139,6 +149,55 @@ class LlamaBridge {
     external fun rerankScore(query: ByteArray, doc: ByteArray): Float
 
     external fun unloadAux()
+
+    // STEP 7 (NEW) -------------------------------------------------------------
+    // ---------------------------------------------------------------- overlapped loading
+    // Only ONE background load can run at a time. A background load that is never
+    // collected is thrown away by the next loadModel() or unload().
+    //
+    // Typical order for a deep search (all calls from the one engine thread):
+    //   unload()                               Gemma goes away (the chat is kept)
+    //   prefetchAux(reranker)                  the reranker starts loading in the background
+    //   loadAux(embedder) + embed(...)         the embedder works meanwhile
+    //   finishAux()                            the embedder goes, the reranker is active
+    //   prefetchMain(gemma)                    Gemma starts loading in the background
+    //   rerankScore(...) many times            the reranker works meanwhile
+    //   unloadAux() + finishMain()             the reranker goes, Gemma is the main model again
+
+    /**
+     * Starts loading a SEARCH model in the background and returns at once.
+     * kind: KIND_EMBEDDER or KIND_RERANKER.
+     * Returns 0 = started, 3 = unknown kind, 4 = the main model is still loaded,
+     * 5 = a background load is already running.
+     * The search model that is active now is not touched.
+     */
+    external fun prefetchAux(path: String, kind: Int, nThreads: Int): Int
+
+    /**
+     * Waits until the background-loaded search model is ready, frees the search model
+     * that was active, and makes the new one the active one.
+     * Returns 0 = ok, 1 = model file failed to load, 2 = context failed to create,
+     * 8 = the pending model is not a search model, 9 = nothing was started.
+     */
+    external fun finishAux(): Int
+
+    /**
+     * Starts loading the MAIN model (Gemma) in the background and returns at once.
+     * The conversation and the tools were kept while Gemma was away.
+     * Returns 0 = started, 4 = the main model is already loaded, 5 = a background
+     * load is already running.
+     */
+    external fun prefetchMain(path: String, nCtx: Int, nThreads: Int): Int
+
+    /**
+     * Waits until the background-loaded main model is ready and makes it the main model.
+     * Returns 0 = ok, 1 = model file failed to load, 2 = context failed to create,
+     * 8 = the pending model is not a main model, 9 = nothing was started.
+     * After 0, the next generate() reads the whole conversation again (empty KV cache).
+     */
+    external fun finishMain(): Int
+
+    // END STEP 7 ---------------------------------------------------------------
 
     companion object {
         const val KIND_EMBEDDER = 1
