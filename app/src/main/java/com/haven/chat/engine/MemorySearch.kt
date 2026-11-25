@@ -16,14 +16,15 @@
 //
 // WHY "LIGHT": no search models are loaded and Gemma stays in memory. A
 //   keyword match over a few hundred short memories takes milliseconds.
-//   (Heavy search with bge-m3 and a reranker is only built if this turns
-//   out to be not enough.)
+//   (Heavy search with bge-m3 and a reranker is the deep_search_memory tool,
+//   see DeepSearch.kt; this file only mentions it in its hints.)
 //
 // WHAT GEMMA SEES (the user's idea: "show the number of results, and if the
 //   result tokens are few, Gemma can read them"):
 //     Found 7 saved memories (most relevant first):
 //     [1] 19 Nov 2026
 //     User said: ...
+//     Tags: room, firebase, database, app, decision
 //     You answered: ...
 //     ...
 //     Showing the 3 most relevant of 7. 4 more matched but are not shown.
@@ -35,12 +36,23 @@
 // HOW MATCHING WORKS (simple on purpose):
 //   - Gemma's keywords are cut into single lowercase words. Tiny filler
 //     words ("the", "my", "user"...) are dropped.
-//   - A memory matches when its question or answer CONTAINS the word
-//     (so "counter" also finds "counters"). With 3 or more words, at least
-//     2 different words must match (this keeps the weak matches out); with
-//     1 or 2 words, 1 is enough.
-//   - Ranking: a word found in the question counts 2, a word found only in
-//     the answer counts 1. Higher score first, newer first on a tie.
+//   - A memory matches when its TAGS, its question or its answer CONTAINS the
+//     word (so "counter" also finds "counters"). With 3 or more words, at
+//     least 2 different words must match (this keeps the weak matches out);
+//     with 1 or 2 words, 1 is enough.
+//   - Ranking: a word found in the TAGS counts 3 (the tags are the search
+//     keywords Gemma wrote when the memory was saved), in the question 2,
+//     only in the answer 1. Higher score first, newer first on a tie.
+//
+// STEP 7 CHANGES (marked "STEP 7"):
+//   - The TAGS of a memory are searched (and ranked highest) and shown to
+//     Gemma. Memories from before step 7 have no tags and are matched by
+//     their question and answer as before.
+//   - When the deep search tool is available (heavy search is ON), the hints
+//     at the end of a result tell Gemma it may call deep_search_memory
+//     (DEEP_TOOL_NAME) when the quick search finds nothing or too much.
+//     run() and formatResult() have a new parameter "deepAvailable" for
+//     that; its default is false, so older calls work unchanged.
 //
 // NEVER CRASHES: every function returns text or a list, also for strange
 //   input (broken JSON, no keywords, no memories).
@@ -63,6 +75,10 @@ object MemorySearch {
     // -----------------------------------------------------------------
 
     const val TOOL_NAME = "search_memory"
+
+    // STEP 7: the name of the deep search tool (DeepSearch.kt). Written here
+    // too, so the hints of the quick search can name it.
+    const val DEEP_TOOL_NAME = "deep_search_memory"
 
     // The description matters a lot for a small model: it must say WHEN to
     // use the tool and when NOT to.
@@ -181,13 +197,17 @@ object MemorySearch {
 
         val hits = ArrayList<Hit>()
         for (memory in all) {
+            val tags = memory.tags.lowercase()                 // STEP 7
             val question = memory.question.lowercase()
             val answer = (memory.answer ?: "").lowercase()
 
             var distinct = 0
             var score = 0
             for (word in words) {
-                if (question.contains(word)) {
+                if (tags.contains(word)) {
+                    distinct++
+                    score += 3                       // STEP 7: found in the tags
+                } else if (question.contains(word)) {
                     distinct++
                     score += 2                       // found in the question
                 } else if (answer.contains(word)) {
@@ -210,10 +230,12 @@ object MemorySearch {
 
     /**
      * Builds the text that is given back to Gemma as the tool result.
-     *   hits         the matches, best first (from search())
-     *   words        the keywords that were used (shown when nothing matched)
-     *   tokenBudget  how many tokens the text may use (see tokenBudget())
-     *   countTokens  counts the tokens of a text with Gemma's own tokenizer
+     *   hits           the matches, best first (from search())
+     *   words          the keywords that were used (shown when nothing matched)
+     *   tokenBudget    how many tokens the text may use (see tokenBudget())
+     *   countTokens    counts the tokens of a text with Gemma's own tokenizer
+     *   deepAvailable  STEP 7: true when the deep search tool exists; the hints
+     *                  then also name it
      *
      * It always says HOW MANY memories matched. It then adds the memories,
      * best first, while they fit the budget (at least the first one is
@@ -224,15 +246,18 @@ object MemorySearch {
         hits: List<Hit>,
         words: List<String>,
         tokenBudget: Int,
-        countTokens: (String) -> Int
+        countTokens: (String) -> Int,
+        deepAvailable: Boolean = false
     ): String {
         val total = hits.size
 
         // Nothing matched.
         if (total == 0) {
             return "No saved memory matched the keywords (" + words.joinToString(", ") + "). " +
-                    "Tell the user you do not have this saved, or call search_memory again " +
-                    "with different keywords."
+                    "Tell the user you do not have this saved, or call " + TOOL_NAME + " again " +
+                    "with different keywords." +
+                    (if (deepAvailable) " You can also try $DEEP_TOOL_NAME, a slower search that " +
+                            "understands meaning, not only words." else "")
         }
 
         val header = if (total == 1) "Found 1 saved memory:\n"
@@ -257,7 +282,12 @@ object MemorySearch {
             footer.append("Showing the ").append(shown).append(" most relevant of ").append(total)
                 .append(". ").append(total - shown)
                 .append(" more matched but are not shown. If these do not answer the question, ")
-                .append("call search_memory again with more specific keywords.\n")
+                .append("call ").append(TOOL_NAME).append(" again with more specific keywords")
+            if (deepAvailable) {
+                footer.append(", or call ").append(DEEP_TOOL_NAME)
+                    .append(" for a deeper search that understands meaning")
+            }
+            footer.append(".\n")
         } else if (total > 1) {
             footer.append("That is all ").append(total).append(".\n")
         }
@@ -270,12 +300,14 @@ object MemorySearch {
     /**
      * The whole job in one call: reads the keywords, searches, builds the
      * result text. [allMemories] is null when the database could not be read.
+     * [deepAvailable] (STEP 7): true when the deep search tool exists.
      */
     fun run(
         allMemories: List<MemoryEntity>?,
         argsJson: String,
         tokenBudget: Int,
-        countTokens: (String) -> Int
+        countTokens: (String) -> Int,
+        deepAvailable: Boolean = false
     ): String {
         if (allMemories == null) {
             return "The saved memories could not be read right now. " +
@@ -286,21 +318,28 @@ object MemorySearch {
             return "No usable keywords were given. " +
                     "Call search_memory again with 2 to 5 short keywords."
         }
-        return formatResult(search(allMemories, words), words, tokenBudget, countTokens)
+        return formatResult(search(allMemories, words), words, tokenBudget, countTokens, deepAvailable)
     }
 
     // -----------------------------------------------------------------
     // SMALL HELPERS
     // -----------------------------------------------------------------
 
-    // One memory as Gemma reads it:
-    //   [1] 19 Nov 2026
-    //   User said: ...
-    //   You answered: ...
-    private fun entryText(number: Int, memory: MemoryEntity): String {
+    /**
+     * One memory as Gemma reads it. Public, because the deep search shows
+     * its results in the same way:
+     *   [1] 19 Nov 2026
+     *   User said: ...
+     *   Tags: room, firebase, database          (only when the memory has tags)
+     *   You answered: ...
+     */
+    fun entryText(number: Int, memory: MemoryEntity): String {
         val out = StringBuilder()
         out.append('[').append(number).append("] ").append(dateText(memory.createdAt)).append('\n')
         out.append("User said: ").append(cut(memory.question, MAX_QUESTION_CHARS)).append('\n')
+        if (memory.tags.isNotBlank()) {
+            out.append("Tags: ").append(memory.tags.trim()).append('\n')
+        }
         val answer = memory.answer
         if (!answer.isNullOrBlank()) {
             out.append("You answered: ").append(cut(answer, MAX_ANSWER_CHARS)).append('\n')

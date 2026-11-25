@@ -66,7 +66,7 @@
 //   The progress / result dialog is the same one as for "remember" (memoryJob).
 //
 // PHASE 4, STEP 6 (marked "STEP 6"): LIGHT SEARCH FOR GEMMA.
-//   When the user sends a message, Gemma may get ONE tool: search_memory
+//   When the user sends a message, Gemma may get the tool search_memory
 //   (see MemorySearch.kt). It is given only when
 //     - the setting "Memory search" is ON, and
 //     - there is at least one saved memory (otherwise there is nothing to
@@ -102,16 +102,14 @@
 //          (the vectors are simply made next time).
 //        - If the user cancels DURING this part, the chat is NOT deleted
 //          (cancel always means "do not delete").
-//
-// STILL TEMPORARY:
-//   - The deep search tool (heavy search while chatting) is not wired here
-//     yet; only the vectors are made.
-//
-// IDS: messages shown on screen need a unique id for the list. Messages
-//   loaded from the database keep their database id (positive numbers).
-//   Messages created in this session get a temporary NEGATIVE id, so the
-//   two kinds can never collide. (The memory job reads the messages from
-//   the DATABASE, so it always sees the real, positive ids.)
+//   C) DEEP SEARCH FOR GEMMA. Next to the quick search_memory tool, Gemma
+//      gets the tool deep_search_memory (DeepSearch.kt) when ALL of this is
+//      true: heavy search is ON, the embedder AND the reranker files exist,
+//      and at least one memory has a vector from the current embedder. The
+//      quick search's hints then mention the deep one. A deep search is
+//      slow (Gemma is unloaded, the two search models run, Gemma is loaded
+//      again); the chip says "Searching memories..." the whole time. The
+//      Stop button takes effect when the search tool returns.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -126,6 +124,7 @@ import com.haven.chat.data.ChatRepository
 import com.haven.chat.data.ChatSummary
 import com.haven.chat.data.MemoryRepository
 import com.haven.chat.data.Role
+import com.haven.chat.engine.DeepSearch
 import com.haven.chat.engine.EngineManager
 import com.haven.chat.engine.IndexResult
 import com.haven.chat.engine.MemoryExtractor
@@ -333,14 +332,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Save the user's message (also moves the chat to the top).
             repo.addMessage(chatId, userMessage)
 
-            // STEP 6: does Gemma get the memory search tool for this answer?
-            // Only when the setting is ON and there is something to search.
-            val tool: EngineManager.ToolRunner? =
-                if (SettingsViewModel.active.memorySearch && memoryRepo.count() > 0) {
-                    memorySearchTool()
-                } else {
-                    null
-                }
+            // STEP 6 / STEP 7: which memory search tools does Gemma get for
+            // this answer?
+            val tools = memoryTools(SettingsViewModel.active)
 
             // Ask the real engine.
             startGeneration(
@@ -348,27 +342,52 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 answerId = answerId,
                 userText = clean,
                 isFirstExchange = isNewChat,
-                tool = tool
+                tools = tools
             )
         }
     }
 
-    // STEP 6: the memory search tool, ready to be handed to the engine.
+    // STEP 6 / STEP 7: decides which memory search tools Gemma gets.
+    //   - none, when there is no saved memory at all (nothing to search);
+    //   - the quick search_memory, when the setting "Memory search" is ON;
+    //   - the deep_search_memory, when heavy search is ON, BOTH model files
+    //     exist, and at least one memory has a vector from the current
+    //     embedder (without vectors a deep search could find nothing).
+    // Runs inside a coroutine (it reads the database).
+    private suspend fun memoryTools(s: AppSettings): List<EngineManager.ToolRunner> {
+        if (memoryRepo.count() <= 0) return emptyList()
+
+        val deepReady = s.heavySearch &&
+                DeepSearch.filesReady(s.embedderPath, s.rerankerPath) &&
+                memoryRepo.vectorCount(MemoryIndexer.embeddingModelName(s.embedderPath)) > 0
+
+        val tools = ArrayList<EngineManager.ToolRunner>()
+        if (s.memorySearch) tools.add(memorySearchTool(deepReady))
+        if (deepReady) {
+            tools.add(DeepSearch(memoryRepo, s.embedderPath, s.rerankerPath).toolRunner())
+        }
+        return tools
+    }
+
+    // STEP 6: the quick memory search tool, ready to be handed to the engine.
     // MemorySearch.kt holds what Gemma reads (name, description, parameters)
     // and does the matching. This function only connects it to the database.
-    private fun memorySearchTool(): EngineManager.ToolRunner = EngineManager.ToolRunner(
-        name = MemorySearch.TOOL_NAME,
-        description = MemorySearch.TOOL_DESCRIPTION,
-        parametersJson = MemorySearch.TOOL_PARAMETERS_JSON,
-        // Called by the engine when Gemma calls the tool. It runs on the
-        // engine's WORKER thread (never the main thread), so waiting for the
-        // database here is fine. allMemories() gives null if the database
-        // could not be read; MemorySearch then tells Gemma it could not look.
-        run = { argsJson, tokenBudget, countTokens ->
-            val all = runBlocking { memoryRepo.allMemories() }
-            MemorySearch.run(all, argsJson, tokenBudget, countTokens)
-        }
-    )
+    // [deepAvailable] (STEP 7): the deep search tool is offered too, so the
+    // hints of the result may name it.
+    private fun memorySearchTool(deepAvailable: Boolean): EngineManager.ToolRunner =
+        EngineManager.ToolRunner(
+            name = MemorySearch.TOOL_NAME,
+            description = MemorySearch.TOOL_DESCRIPTION,
+            parametersJson = MemorySearch.TOOL_PARAMETERS_JSON,
+            // Called by the engine when Gemma calls the tool. It runs on the
+            // engine's WORKER thread (never the main thread), so waiting for the
+            // database here is fine. allMemories() gives null if the database
+            // could not be read; MemorySearch then tells Gemma it could not look.
+            run = { argsJson, tokenBudget, countTokens ->
+                val all = runBlocking { memoryRepo.allMemories() }
+                MemorySearch.run(all, argsJson, tokenBudget, countTokens, deepAvailable)
+            }
+        )
 
     // Asks Gemma and streams the answer into the bubble "answerId".
     private fun startGeneration(
@@ -376,7 +395,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         answerId: Long,
         userText: String,
         isFirstExchange: Boolean,
-        tool: EngineManager.ToolRunner?          // STEP 6: the memory search tool, or null
+        tools: List<EngineManager.ToolRunner>      // STEP 6/7: the memory search tools (may be empty)
     ) {
         // Collect the pieces that arrive while Gemma writes.
         val answerSoFar = StringBuilder()
@@ -442,10 +461,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             },
 
-            // STEP 6: the memory search tool (or null).
-            tool = tool,
-
-            // STEP 6: Gemma asked for the tool, so everything streamed so far
+            // STEP 6: Gemma asked for a tool, so everything streamed so far
             // was only the lead-in to the call. Start the bubble again: throw
             // the collected pieces away and empty the bubble. (The final
             // texts come in "result" at the end.)
@@ -453,7 +469,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 answerSoFar.clear()
                 thinkingSoFar.clear()
                 updateMessage(answerId) { it.copy(text = "", thinking = null) }
-            }
+            },
+
+            // STEP 6/7: the memory search tools (may be empty).
+            tools = tools
         )
     }
 
