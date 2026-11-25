@@ -67,16 +67,11 @@
 //
 // PHASE 4, STEP 6 (marked "STEP 6"): LIGHT SEARCH FOR GEMMA.
 //   When the user sends a message, Gemma may get the tool search_memory
-//   (see MemorySearch.kt). It is given only when
-//     - the setting "Memory search" is ON, and
-//     - there is at least one saved memory (otherwise there is nothing to
-//       search, and the prompt stays as short as before).
-//   If Gemma calls the tool, EngineManager runs it (the keyword match runs
-//   on the engine's worker thread, MemorySearch does the work) and Gemma
-//   writes the answer from the result. While that happens the bubble is
-//   started again (onRestart): what was streamed before the call was only
-//   the lead-in, so the collected thinking and answer pieces are thrown
-//   away. The final answer is saved like any other answer.
+//   (see MemorySearch.kt). If Gemma calls the tool, EngineManager runs it
+//   (the keyword match runs on the engine's worker thread, MemorySearch
+//   does the work) and Gemma writes the answer from the result. While that
+//   happens the bubble is started again (onRestart). The final answer is
+//   saved like any other answer.
 //   (A question that is answered with the help of memories can itself be
 //   picked up later by "remember my personal things", as a question about
 //   the user's own life. That is fine: the user can delete it on the
@@ -110,6 +105,32 @@
 //      slow (Gemma is unloaded, the two search models run, Gemma is loaded
 //      again); the chip says "Searching memories..." the whole time. The
 //      Stop button takes effect when the search tool returns.
+//
+// AFTER STEP 7 (marked "FIX A" and "FIX B"): TWO BUG FIXES.
+//
+//   FIX A: THE SEARCH TOOL IS OFFERED EVEN WHEN NO MEMORY IS SAVED.
+//     Problem: with 0 memories memoryTools() returned NO tool. The system
+//     prompt still tells Gemma to call search_memory, so Gemma had no real
+//     tool and wrote a FAKE call as plain text, for example
+//     "<call:search_memory> ..." or "search_memory(keywords=[...])". The
+//     engine never saw a call, so nothing was searched and the answer ended.
+//     Fix: when the setting "Memory search" is ON, search_memory is ALWAYS
+//     offered. With an empty memory the search returns "No saved memory
+//     matched...", and Gemma can then honestly say it has no record.
+//     The DEEP tool is still offered only when vectors exist (it needs them).
+//     Price: a few extra prompt tokens when memory is empty.
+//
+//   FIX B: THE THINKING BOX KEEPS ITS TEXT WHEN GEMMA CALLS A TOOL.
+//     Problem: onRestart cleared the thinking text, and onDone used only the
+//     thinking of the LAST round (the C++ engine forgets earlier rounds). So
+//     after a tool call the box vanished and came back with only the new
+//     thinking.
+//     Fix: onRestart now KEEPS the collected thinking and adds a divider
+//     line ("Searched memories"). Only the lead-in ANSWER text (what Gemma
+//     wrote before the call) is thrown away. When the answer is finished,
+//     if a tool was used, the whole collected thinking (round 1, divider,
+//     round 2) is shown and SAVED. If no tool was used, nothing changes:
+//     the thinking of the engine's final result is used, as before.
 // =====================================================================
 package com.haven.chat.ui.chat
 
@@ -347,16 +368,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // STEP 6 / STEP 7: decides which memory search tools Gemma gets.
-    //   - none, when there is no saved memory at all (nothing to search);
-    //   - the quick search_memory, when the setting "Memory search" is ON;
+    // STEP 6 / STEP 7 / FIX A: decides which memory search tools Gemma gets.
+    //   - the quick search_memory, whenever the setting "Memory search" is ON.
+    //     FIX A: this is true EVEN WITH 0 SAVED MEMORIES. Before, an empty
+    //     memory gave Gemma no tool, but the system prompt still told it to
+    //     call search_memory, so Gemma wrote a fake call as plain text. Now
+    //     the tool always exists; with an empty memory it simply answers
+    //     "No saved memory matched", and Gemma can say it has no record.
     //   - the deep_search_memory, when heavy search is ON, BOTH model files
     //     exist, and at least one memory has a vector from the current
-    //     embedder (without vectors a deep search could find nothing).
+    //     embedder (without vectors a deep search could find nothing; a
+    //     vector can only exist when a memory exists).
     // Runs inside a coroutine (it reads the database).
     private suspend fun memoryTools(s: AppSettings): List<EngineManager.ToolRunner> {
-        if (memoryRepo.count() <= 0) return emptyList()
-
         val deepReady = s.heavySearch &&
                 DeepSearch.filesReady(s.embedderPath, s.rerankerPath) &&
                 memoryRepo.vectorCount(MemoryIndexer.embeddingModelName(s.embedderPath)) > 0
@@ -383,6 +407,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // engine's WORKER thread (never the main thread), so waiting for the
             // database here is fine. allMemories() gives null if the database
             // could not be read; MemorySearch then tells Gemma it could not look.
+            // FIX A: with 0 memories allMemories() gives an EMPTY list (not
+            // null), and MemorySearch answers "No saved memory matched...".
             run = { argsJson, tokenBudget, countTokens ->
                 val all = runBlocking { memoryRepo.allMemories() }
                 MemorySearch.run(all, argsJson, tokenBudget, countTokens, deepAvailable)
@@ -400,6 +426,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Collect the pieces that arrive while Gemma writes.
         val answerSoFar = StringBuilder()
         val thinkingSoFar = StringBuilder()
+
+        // FIX B: true as soon as Gemma has called a tool in this answer. Then
+        // thinkingSoFar holds ALL rounds of thinking (with dividers), which
+        // is more than the engine's final result knows.
+        var toolWasUsed = false
 
         // The thinking switch and the longest reply (in tokens, thinking
         // included) come from the Settings screen.
@@ -441,7 +472,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         // Normal end (also covers "stopped after some text").
                         else -> old.copy(
                             text = result.answer.ifEmpty { old.text },
-                            thinking = result.thinking.ifEmpty { null },
+                            // FIX B: after a tool call the engine's result
+                            // knows only the LAST round of thinking. Use the
+                            // whole collected thinking instead (round 1,
+                            // divider, round 2). Without a tool call nothing
+                            // changes: the engine's result is used, as before.
+                            thinking = if (toolWasUsed && thinkingSoFar.isNotEmpty()) {
+                                thinkingSoFar.toString().trim()
+                            } else {
+                                result.thinking.ifEmpty { null }
+                            },
                             tokensPerSecond = result.tokensPerSecond,
                             tokenCount = result.tokenCount
                         )
@@ -461,14 +501,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             },
 
-            // STEP 6: Gemma asked for a tool, so everything streamed so far
-            // was only the lead-in to the call. Start the bubble again: throw
-            // the collected pieces away and empty the bubble. (The final
-            // texts come in "result" at the end.)
+            // STEP 6 / FIX B: Gemma asked for a tool, so the ANSWER text that
+            // was streamed so far was only the lead-in to the call: throw it
+            // away and empty the bubble text.
+            // FIX B: the THINKING text is NOT thrown away any more. It is kept,
+            // and a divider is added, so the box reads:
+            //     first thinking
+            //     ---
+            //     Searched memories
+            //     ---
+            //     new thinking (streams in after the tool result)
+            // (The divider is Markdown: "---" alone on a line is a rule line.)
+            // If thinking is OFF there is no thinking text, so there is nothing
+            // to keep and no divider is added.
             onRestart = {
+                toolWasUsed = true
                 answerSoFar.clear()
-                thinkingSoFar.clear()
-                updateMessage(answerId) { it.copy(text = "", thinking = null) }
+                if (thinkingSoFar.isNotEmpty()) {
+                    thinkingSoFar.append(TOOL_DIVIDER)
+                }
+                updateMessage(answerId) {
+                    it.copy(
+                        text = "",
+                        thinking = if (thinkingSoFar.isNotEmpty()) thinkingSoFar.toString() else null
+                    )
+                }
             },
 
             // STEP 6/7: the memory search tools (may be empty).
@@ -487,6 +544,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         viewModelScope.launch {
             // Save the answer (not error texts, not empty ones).
+            // FIX B: the saved message carries the full thinking text too, so
+            // reopening the chat shows all rounds.
             val answer = messages.firstOrNull { it.id == answerId }
             if (answer != null && answerId !in localOnlyIds && answer.text.isNotBlank()) {
                 repo.addMessage(chatId, answer)
@@ -909,5 +968,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // deleted because the job was not complete.
         private const val NOT_DELETED_HINT =
             "\nThe chat was NOT deleted. You can try again, or choose \"Delete without saving\"."
+
+        // FIX B: put between two rounds of thinking when Gemma called a tool.
+        // It is Markdown: "---" alone on a line is drawn as a thin rule, and
+        // the middle line is bold text. (Lines start at the left margin on
+        // purpose, so MarkdownText reads them as a rule and a paragraph.)
+        private const val TOOL_DIVIDER = "\n\n---\n\n**Searched memories**\n\n---\n\n"
     }
 }
