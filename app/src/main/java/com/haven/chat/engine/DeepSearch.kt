@@ -36,6 +36,18 @@
 //   - an embedder problem: Gemma is told the deep search is not available
 //     and may use search_memory instead.
 //
+// AFTER STEP 7 (marked "STOP FIX"): THE STOP BUTTON WORKS HERE.
+//   The slow parts of this search (loading a search model, and above all the
+//   reranker loop with up to 50 passes) used to ignore the Stop button.
+//   Now the search asks the swap "did the user press Stop?"
+//   (swap.isStopRequested) at these points, and ends at once:
+//     - before the embedder is loaded (then NO model is swapped at all),
+//     - after the query was embedded (before the reranker is loaded),
+//     - between two reranker passes.
+//   When it ends early it returns a short text. EngineManager sees Stop and
+//   does not ask Gemma to continue; it only loads Gemma AGAIN (that step
+//   cannot be skipped: the app needs the model back).
+//
 // TRIAL AND ERROR: the numbers that decide quality and speed are constants
 //   just below (how many candidates, how many results, the time limit).
 //
@@ -91,6 +103,9 @@ class DeepSearch(
             return "No query was given. Call $TOOL_NAME again with a short query in plain words."
         }
 
+        // STOP FIX: the user pressed Stop already. Do not even swap the models.
+        if (swap.isStopRequested) return STOPPED_TEXT
+
         // ---- the saved vectors (of the CURRENT embedding model) ----
         val model = MemoryIndexer.embeddingModelName(embedderPath)
         val stored = runBlocking { memories.loadVectors(model) }
@@ -100,6 +115,9 @@ class DeepSearch(
                     "Use ${MemorySearch.TOOL_NAME} instead."
         }
 
+        // STOP FIX: checked again, because reading the vectors takes a moment.
+        if (swap.isStopRequested) return STOPPED_TEXT
+
         // ---- 1) the embedder: embed the query ----
         val embedderProblem = swap.useEmbedder(embedderPath)
         if (embedderProblem != null) {
@@ -108,6 +126,9 @@ class DeepSearch(
         }
         val queryVector = swap.embed(query)
             ?: return "The deep search could not read the query. Use ${MemorySearch.TOOL_NAME} instead."
+
+        // STOP FIX: stop before the reranker is loaded (that load is slow).
+        if (swap.isStopRequested) return STOPPED_TEXT
 
         // ---- 2) the closest memories by vector ----
         val closest = closestByVector(queryVector, stored.map { it.memoryId to it.vector })
@@ -124,6 +145,10 @@ class DeepSearch(
 
         // ---- 3) the reranker: score every candidate against the query ----
         val ranked = rerank(query, candidates, swap)
+
+        // STOP FIX: the user pressed Stop during the reranking: the scores are
+        // not complete, so do not present them as a real result.
+        if (swap.isStopRequested) return STOPPED_TEXT
 
         // ---- 4) the result text ----
         return formatResult(ranked, tokenBudget, countTokens)
@@ -164,6 +189,7 @@ class DeepSearch(
     //   - With a working reranker: sorted by its score.
     //   - Without (file missing, cannot load, or no pair could be scored):
     //     the order from the vector search is kept (already best first).
+    // STOP FIX: the loop ends as soon as the user presses Stop.
     private fun rerank(
         query: String,
         candidates: List<MemoryEntity>,
@@ -172,6 +198,8 @@ class DeepSearch(
         if (rerankerPath.isBlank() || !File(rerankerPath).exists()) {
             return candidates.take(TOP_RESULTS)
         }
+        // STOP FIX: do not load the reranker when Stop was pressed.
+        if (swap.isStopRequested) return candidates.take(TOP_RESULTS)
         if (swap.useReranker(rerankerPath) != null) {
             return candidates.take(TOP_RESULTS)
         }
@@ -179,6 +207,9 @@ class DeepSearch(
         val started = System.nanoTime()
         val scored = ArrayList<Pair<MemoryEntity, Float>>()
         for (memory in candidates) {
+            // STOP FIX: the user pressed Stop: leave the slow loop now.
+            if (swap.isStopRequested) break
+
             // Stop early when it takes too long: the candidates come best
             // first, so the ones read so far are the most promising ones.
             val elapsedMs = (System.nanoTime() - started) / 1_000_000
@@ -280,6 +311,10 @@ class DeepSearch(
 
         const val TOOL_PARAMETERS_JSON =
             """{"type":"object","properties":{"query":{"type":"string","description":"what to look for, as a short phrase or sentence in plain words"}},"required":["query"]}"""
+
+        // STOP FIX: what the tool returns when the user pressed Stop. (Gemma is
+        // not asked to continue after Stop, so this text is only for the record.)
+        private const val STOPPED_TEXT = "The user pressed Stop. The search was cancelled."
 
         // ---- numbers to tune by trial and error ----
 

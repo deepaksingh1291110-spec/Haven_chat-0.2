@@ -101,6 +101,23 @@
 //      loads the model again.
 //      While Gemma is out, exact token counting is not possible; a safe
 //      guess (1 token per 3 characters) is used (see tokensOf).
+//
+// AFTER STEP 7 (marked "STOP FIX"): STOP DURING A TOOL SEARCH.
+//   Problem: the Stop button was LOST while a memory search ran. The reason:
+//   after the tool, generate() was called again, and the C++ generate()
+//   clears its stop flag when it starts. So Gemma re-read the whole prompt
+//   and wrote a full answer although the user had pressed Stop.
+//   Fix (three small parts):
+//     1) After the tools have run, the engine checks stopRequested. If the
+//        user pressed Stop, it does NOT call generate() again. The answer
+//        ends as "stopped" (the screen shows "(stopped)", nothing is saved).
+//     2) A tool call that has not started yet when Stop is pressed is not
+//        run; Gemma is just told "the user pressed Stop" (the tool result
+//        is still added, so the conversation stays well-formed).
+//     3) SearchSwap has a new property isStopRequested, so a deep search
+//        (DeepSearch.kt) can end its slow loop (the reranker) at once.
+//   What Stop CANNOT skip: the swap still ends by loading Gemma AGAIN. The
+//   app needs the model back, so that step always runs.
 // =====================================================================
 package com.haven.chat.engine
 
@@ -287,6 +304,14 @@ object EngineManager {
 
         // A search model is loaded right now.
         private var auxLoaded = false
+
+        /**
+         * STOP FIX: true when the user has pressed Stop. A slow tool (the deep
+         * search) checks this between its steps and ends early. The swap is
+         * still closed normally afterwards (Gemma is loaded again).
+         */
+        val isStopRequested: Boolean
+            get() = stopRequested
 
         // Frees what is loaded and loads the search model [path] of this [kind]
         // (LlamaBridge.KIND_EMBEDDER or KIND_RERANKER). Returns null = ok.
@@ -871,6 +896,13 @@ object EngineManager {
                         val text: String
                         if (runner == null) {
                             text = "There is no tool with this name. Answer without it."
+                        } else if (stopRequested) {
+                            // STOP FIX: the user pressed Stop before this call
+                            // started (for example during an earlier call of
+                            // the same round). Do not run it. The tool result
+                            // is still added below, so the conversation stays
+                            // well-formed.
+                            text = "The user pressed Stop. Do not search any more."
                         } else {
                             // STEP 7: a deep tool frees Gemma and loads it again.
                             val outcome = runToolOnWorker(b, runner, call.argumentsJson, budget)
@@ -887,6 +919,16 @@ object EngineManager {
                     onMain { searchingMemory = false }
 
                     if (swapFailure != null) break
+
+                    // STOP FIX: the user pressed Stop while the tool ran. Do NOT
+                    // call generate() again: the C++ generate() clears its stop
+                    // flag when it starts, so Gemma would read the whole prompt
+                    // again and write a full answer anyway. End the answer as
+                    // "stopped" instead.
+                    if (stopRequested) {
+                        stats = "STOPPED while searching memories"
+                        break
+                    }
 
                     // An EMPTY text: nothing new is added, Gemma reads the tool
                     // result and continues. (After a deep search Gemma reads
