@@ -4,29 +4,30 @@
 //       the user taps the app icon (see AndroidManifest.xml).
 // JOBS: 1) Show the splash: first Android's black system splash, then
 //          our own picture (HavenSplash), then the real app (HavenApp).
-//       2) Check and request the "All files access" permission, which
-//          the app needs to read model files (GGUF) from the phone.
-//          Only an Activity can do this, so it lives here and not in
-//          the UI files. The result is passed down to the UI.
-//       3) PHASE 2: start the native llama.cpp engine ONCE at launch
+//       2) PHASE 2: start the native llama.cpp engine ONCE at launch
 //          (EngineManager.init). It only starts the engine; it does
 //          NOT load the model. The model is loaded later, when the user
-//          taps "Load Model" in Settings.
+//          taps "Load Model" in Settings (or chooses a model on the
+//          Model management screen).
+//
+// PRIVATE MODELS (marked "MODELS"): NO MORE "ALL FILES ACCESS".
+//   This file used to check and ask for the permission "All files access"
+//   (and READ_EXTERNAL_STORAGE on old phones), because the models were read
+//   from a normal phone folder. Now the models are COPIED into the app's
+//   private space (ModelStore), which needs no permission at all. So all of
+//   that code is gone:
+//     - the storageAllowed state and the legacy permission launcher,
+//     - hasStorageAccess() and requestStorageAccess(),
+//     - onResume() (it only re-checked the permission),
+//     - the imports that belonged to them.
+//   HavenApp() takes no parameters any more.
 // =====================================================================
 package com.haven.chat
 
-import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
@@ -34,7 +35,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.haven.chat.engine.EngineManager
 import com.haven.chat.ui.HavenApp
@@ -42,18 +42,6 @@ import com.haven.chat.ui.splash.HavenSplash
 import com.haven.chat.ui.theme.HavenChatTheme
 
 class MainActivity : ComponentActivity() {
-
-    // True when the app may read files. "mutableStateOf" means the UI
-    // redraws by itself when this changes (for example the Settings
-    // badge changes from "Tap to allow" to "Allowed").
-    private var storageAllowed by mutableStateOf(false)
-
-    // ONLY for old phones (Android 10 and older): the normal pop-up that
-    // asks for permission. When the user answers, we re-check.
-    private val legacyPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            storageAllowed = hasStorageAccess()
-        }
 
     // onCreate runs ONE time when the screen starts.
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,9 +63,6 @@ class MainActivity : ComponentActivity() {
         // Draw behind the status bar and navigation bar (full-screen look).
         enableEdgeToEdge()
 
-        // Check the permission once at start.
-        storageAllowed = hasStorageAccess()
-
         // Everything inside setContent is drawn by Jetpack Compose.
         setContent {
             HavenChatTheme {
@@ -92,56 +77,11 @@ class MainActivity : ComponentActivity() {
                         // After 2 seconds the splash calls this lambda.
                         HavenSplash(onFinished = { showSplash = false })
                     } else {
-                        HavenApp(
-                            storageAllowed = storageAllowed,
-                            onRequestStorageAccess = { requestStorageAccess() }
-                        )
+                        // MODELS: no permission parameters any more.
+                        HavenApp()
                     }
                 }
             }
-        }
-    }
-
-    // onResume runs every time the app comes back to the front. The user
-    // may have just allowed the permission in the phone's settings page,
-    // so we check again.
-    override fun onResume() {
-        super.onResume()
-        storageAllowed = hasStorageAccess()
-    }
-
-    // Do we have permission to read files on the phone?
-    private fun hasStorageAccess(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ : the special "All files access" switch.
-            Environment.isExternalStorageManager()
-        } else {
-            // Android 10 and older: the normal read-storage permission.
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    // Ask the user for permission.
-    private fun requestStorageAccess() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ : open the phone's "All files access" page for
-            // OUR app. The user flips the switch by hand.
-            try {
-                startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
-                )
-            } catch (e: Exception) {
-                // Some phones lack that page. Fall back to the general list.
-                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-            }
-        } else {
-            // Old phones: show the normal permission pop-up.
-            legacyPermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
     }
 }

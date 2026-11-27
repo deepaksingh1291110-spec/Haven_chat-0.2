@@ -6,9 +6,9 @@
 //                   auto-name chats, memory thinking, memory search,
 //                   heavy search)
 //         card:     Heavy search models (only when heavy search is ON):
-//                   embedder file + reranker file, each with Browse
-//         field:    model file path + Browse button
-//         card:     Storage Status (file access allowed or not)
+//                   embedder + reranker, each chosen from the added models
+//         card:     Model: the MAIN model, chosen from the added models,
+//                   and a button "Manage models"
 //         button:   Load Model
 //         card:     System Prompt Editor (prompt, stop sequence, reset)
 //         card:     Memory Prompt Editor (the prompt that finds the personal
@@ -19,13 +19,10 @@
 //   notes: changing context size or threads needs the model to reload.
 //
 // PHASE 2 CHANGES:
-//   - Browse now opens Android's file picker. The picked file is turned
-//     into a normal path (/storage/emulated/0/...) and put in the box.
 //   - The Load Model button shows the REAL engine status: "Loading
 //     model..." (with a small spinner), "Model loaded", or an error text.
 //   - Load Model now loads what is ON SCREEN (the draft), not the older
 //     saved settings. So onLoadModel receives the draft.
-//   - onBrowseClick is gone: the picker lives inside this file.
 //
 // PHASE 3 CHANGES (marked "PHASE 3"):
 //   - New setting "Auto-name chats" (default OFF): a switch in the
@@ -48,43 +45,42 @@
 //   and ChatViewModel uses the value instead of the old fixed 1024.
 //
 // PHASE 4 CHANGES (marked "PHASE 4", "STEP 6" and "STEP 7"):
-//   - "Memory thinking" (default ON): decides whether Gemma uses thinking
-//     when it looks for the PERSONAL messages of a chat. Thinking found
-//     every personal message in the user's tests but is slower.
+//   - "Memory thinking" (default ON), "Memory search" (default ON) and
+//     "Heavy search" (default OFF) switches, and the Memory Prompt Editor
+//     (empty = use the built-in prompt; effectiveMemoryPrompt(settings)
+//     gives the prompt that is really used).
 //   - The Load Model button is also switched off while Gemma is saving
 //     memories (the engine is busy then), and says "Saving memories...".
-//   - STEP 6, "Memory search" (default ON): Gemma may look up the saved
-//     memories during a chat answer (the search_memory tool).
-//   - STEP 7, HEAVY SEARCH:
-//       * "Heavy search" switch (default OFF) in the Model Configuration
-//         card. AppSettings has the new field heavySearch.
-//       * When it is ON, a card "Heavy search models" appears with TWO file
-//         pickers: the embedder (bge-m3) and the reranker
-//         (bge-reranker-v2-m3). AppSettings has embedderPath and
-//         rerankerPath (empty = none chosen). Each picker works like the main
-//         model's Browse button and says if the file was found.
-//       * A card "Memory Prompt Editor" lets the user edit the prompt that
-//         finds the personal messages and writes their 4 to 6 tags, for
-//         trial and error WITHOUT rebuilding the app. AppSettings has the new
-//         field memoryPrompt; EMPTY means "use the built-in prompt"
-//         (MemoryPrompts.DEFAULT_EXTRACTION_PROMPT). "Reset to default"
-//         empties it again. The reply must keep the shape
-//         {"personal": [{"n": 2, "tags": ["..."]}]}, because the app reads it.
-//       * effectiveMemoryPrompt(settings) gives the prompt that is really
-//         used (the edited one, or the built-in one).
+//
+// PRIVATE MODELS (marked "MODELS"): NO MORE "ALL FILES ACCESS".
+//   - The model files now live in the app's private space (ModelStore) and
+//     are added on the Model management screen. So this screen has NO file
+//     picker, NO "Browse" buttons and NO Storage Status card any more.
+//   - The MAIN model, the EMBEDDER and the RERANKER are chosen from a drop
+//     down list of the models that were added (ModelPicker below). They
+//     still write the same three settings: modelPath, embedderPath,
+//     rerankerPath. The Model management screen writes the same ones.
+//   - A button "Manage models" opens the Model management screen
+//     (onManageModels). Edits that were not saved are lost when leaving
+//     this screen for it.
+//   - The Load Model button is switched off while no main model is chosen
+//     (or its file is gone) and says why.
+//   - DEFAULT_MODEL_PATH is now empty: a new install has no model chosen.
+//   - The two parameters storageAllowed and onStorageClick are gone.
+//
+// LONG PROMPTS (marked "PROMPTS"): the System Prompt and the Memory Prompt
+//   boxes are COLLAPSED: they show 6 lines only, so the page is short. Tapping
+//   a box opens it fully (and starts editing). A "Show less" button folds it
+//   again. See ExpandablePromptField.
 //
 // NOT YET: the "Inference Parameters" card (temperature, etc.) from the
 //   design. We add it later.
 // =====================================================================
 package com.haven.chat.ui.settings
 
-import android.net.Uri
-import android.provider.DocumentsContract
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -104,9 +100,12 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -122,6 +121,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -129,8 +129,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.haven.chat.data.ModelStore
+import com.haven.chat.data.StoredModel
 import com.haven.chat.engine.EngineManager
 import com.haven.chat.engine.MemoryPrompts
 import java.io.File
@@ -143,10 +149,16 @@ import kotlin.math.roundToInt
 // ---------------------------------------------------------------------
 const val DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and briefly."
 const val DEFAULT_STOP_SEQUENCE = "<|endoftext|>"
-const val DEFAULT_MODEL_PATH = "/storage/emulated/0/HavenModels/gemma4-e2b-q4_0.gguf"
+
+// MODELS: empty = no model chosen yet (a new install). The user adds a model
+// on the Model management screen, and the first one is chosen automatically.
+const val DEFAULT_MODEL_PATH = ""
 
 private const val MAX_PROMPT_CHARS = 2000   // longest allowed system prompt
 private const val MAX_STOP_CHARS = 100      // longest allowed stop sequence
+
+// PROMPTS: how many lines a long prompt box shows while it is folded.
+private const val COLLAPSED_PROMPT_LINES = 6
 
 // STEP 7: longest memory (extraction) prompt. The built-in one is about
 // 3000 characters, so there is plenty of room for edits. Public, because
@@ -172,7 +184,7 @@ data class AppSettings(
     val threads: Int = 4,                          // CPU threads (1 to 6)
     val contextSize: Int = 4096,                   // one of CONTEXT_SIZES
     val thinkingEnabled: Boolean = true,           // show the AI's thinking
-    val modelPath: String = DEFAULT_MODEL_PATH,    // where the GGUF file is
+    val modelPath: String = DEFAULT_MODEL_PATH,    // MAIN model file ("" = none chosen)
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
     val stopSequence: String = DEFAULT_STOP_SEQUENCE,
     val autoNameChats: Boolean = false,            // PHASE 3: let Gemma title new chats (default OFF)
@@ -192,112 +204,34 @@ data class AppSettings(
 fun effectiveMemoryPrompt(settings: AppSettings): String =
     settings.memoryPrompt.ifBlank { MemoryPrompts.DEFAULT_EXTRACTION_PROMPT }
 
-// ---------------------------------------------------------------------
-// HELPER: turns the "address" that Android's file picker gives us into a
-// normal file path that the C++ engine can open.
-//
-// The picker returns something like
-//   content://com.android.externalstorage.documents/document/primary%3AHavenModels%2Fgemma.gguf
-// Its "document id" is   primary:HavenModels/gemma.gguf
-// "primary:" means the phone's internal storage = /storage/emulated/0/
-//
-// Returns null when we cannot make a normal path (SD card, cloud, ...).
-// ---------------------------------------------------------------------
-private fun pathFromPickedUri(uri: Uri): String? {
-    return try {
-        val id = DocumentsContract.getDocumentId(uri)
-        when {
-            // Internal storage: "primary:folder/file.gguf"
-            id.startsWith("primary:") -> "/storage/emulated/0/" + id.removePrefix("primary:")
-            // Some pickers hand over a ready path: "raw:/storage/..."
-            id.startsWith("raw:") -> id.removePrefix("raw:")
-            // SD card, Downloads app ids, cloud drives: no usable path.
-            else -> null
-        }
-    } catch (e: Exception) {
-        null   // not a document address
-    }
-}
-
-// STEP 7: the same checks the main model's Browse button does, for the two
-// search model pickers. If the picked file is usable, [onPath] gets its path
-// and "" is returned; otherwise the plain-words problem is returned.
-private fun checkPickedGguf(uri: Uri, onPath: (String) -> Unit): String {
-    val path = pathFromPickedUri(uri)
-    return when {
-        path == null ->
-            "Cannot use this location. Pick the file from internal storage (for example the HavenModels folder)."
-        !path.endsWith(".gguf", ignoreCase = true) ->
-            "That is not a .gguf file."
-        else -> {
-            onPath(path)
-            ""
-        }
-    }
-}
-
 // ExperimentalLayoutApi is needed for FlowRow (chips that wrap to a new line).
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     initial: AppSettings,                    // settings when the screen opens
-    storageAllowed: Boolean,                 // is "All files access" granted?
     onBack: () -> Unit,                      // back arrow tapped
     onSaveAndReload: (AppSettings) -> Unit,  // "Save & Reload" tapped
     onLoadModel: (AppSettings) -> Unit,      // "Load Model" tapped (gets what is on screen)
-    onStorageClick: () -> Unit               // storage badge tapped (permission)
+    onManageModels: () -> Unit               // MODELS: "Manage models" tapped
 ) {
     // The draft: what the user is editing right now.
     var draft by remember { mutableStateOf(initial) }
-
-    // A short message under the Browse button (for example "not a .gguf file").
-    var browseMessage by remember { mutableStateOf("") }
-
-    // STEP 7: the same kind of message under the two search model pickers.
-    var embedderMessage by remember { mutableStateOf("") }
-    var rerankerMessage by remember { mutableStateOf("") }
 
     // MAX REPLY LENGTH: the text exactly as the user types it. It is kept
     // apart from the draft because "" or "5" is allowed while typing, but
     // the draft only ever receives a VALID number.
     var maxReplyText by remember { mutableStateOf(initial.maxReplyTokens.toString()) }
 
-    // The file picker. "OpenDocument" shows Android's normal file chooser.
-    // When the user picks a file, the lambda below receives its address
-    // (or null if the user cancelled).
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            val path = pathFromPickedUri(uri)
-            browseMessage = when {
-                path == null ->
-                    "Cannot use this location. Pick the file from internal storage (for example the HavenModels folder)."
-                !path.endsWith(".gguf", ignoreCase = true) ->
-                    "That is not a .gguf file."
-                else -> {
-                    draft = draft.copy(modelPath = path)   // put it in the box
-                    ""
-                }
-            }
-        }
-    }
+    // MODELS: the models that were added (the choices of the pickers). They
+    // are read from the private folder once, when the screen opens.
+    val context = LocalContext.current
+    val modelStore = remember { ModelStore(context) }
+    var storedModels by remember { mutableStateOf<List<StoredModel>>(emptyList()) }
+    LaunchedEffect(Unit) { storedModels = modelStore.list() }
 
-    // STEP 7: two more pickers, one for each search model.
-    val embedderPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            embedderMessage = checkPickedGguf(uri) { draft = draft.copy(embedderPath = it) }
-        }
-    }
-    val rerankerPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            rerankerMessage = checkPickedGguf(uri) { draft = draft.copy(rerankerPath = it) }
-        }
-    }
+    // MODELS: does the chosen main model file exist? (A quick check of one
+    // file name, fine to do on screen.)
+    val mainExists = draft.modelPath.isNotBlank() && File(draft.modelPath).exists()
 
     // The REAL engine status. EngineManager.state is Compose state, so
     // this screen redraws by itself when loading starts or ends.
@@ -498,8 +432,7 @@ fun SettingsScreen(
                 // --- STEP 6: Memory search switch ---
                 // ON (default): during a chat answer Gemma may look up your
                 // saved memories (the search_memory tool) when you ask about
-                // your own past. It only does this when you have saved
-                // memories.
+                // your own past.
                 // OFF: Gemma never gets the tool; chat works as before.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -527,8 +460,7 @@ fun SettingsScreen(
                 // models (the embedder finds the closest memories, the
                 // reranker picks the best ones). It is more exact, but slower,
                 // because Gemma is unloaded and loaded again for each deep
-                // search. When it is ON, a card below asks for the two model
-                // files.
+                // search. When it is ON, a card below asks for the two models.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -552,99 +484,76 @@ fun SettingsScreen(
 
             // ================= STEP 7: HEAVY SEARCH MODELS =================
             // Only visible while the Heavy search switch is ON.
+            // MODELS: the two models are chosen from the added models.
             if (draft.heavySearch) {
                 SettingsCard(title = "Heavy search models") {
                     Text(
-                        text = "Choose the two search model files (.gguf) from the phone's " +
-                                "storage. Heavy search stays off until both are chosen.",
+                        text = "Choose the two search models from the models you added. " +
+                                "Heavy search stays off until both are chosen.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     // The embedder (bge-m3): turns texts into vectors.
-                    ModelPathField(
-                        label = "Embedder file (bge-m3)",
-                        path = draft.embedderPath,
-                        onPathChange = { draft = draft.copy(embedderPath = it) },
-                        onBrowse = { embedderPicker.launch(arrayOf("*/*")) },
-                        message = embedderMessage
+                    ModelPicker(
+                        label = "Embedder (bge-m3)",
+                        currentPath = draft.embedderPath,
+                        models = storedModels,
+                        allowNone = true,
+                        onPick = { draft = draft.copy(embedderPath = it) }
                     )
 
                     // The reranker (bge-reranker-v2-m3): picks the best matches.
-                    ModelPathField(
-                        label = "Reranker file (bge-reranker-v2-m3)",
-                        path = draft.rerankerPath,
-                        onPathChange = { draft = draft.copy(rerankerPath = it) },
-                        onBrowse = { rerankerPicker.launch(arrayOf("*/*")) },
-                        message = rerankerMessage
+                    ModelPicker(
+                        label = "Reranker (bge-reranker-v2-m3)",
+                        currentPath = draft.rerankerPath,
+                        models = storedModels,
+                        allowNone = true,
+                        onPick = { draft = draft.copy(rerankerPath = it) }
                     )
                 }
             }
 
-            // ================= MODEL FILE PATH =================
-            SettingsCard(title = "Model file") {
-                OutlinedTextField(
-                    value = draft.modelPath,
-                    onValueChange = { draft = draft.copy(modelPath = it) },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Path to GGUF file") },
-                    singleLine = true
+            // ================= MODEL (MAIN MODEL) =================
+            // MODELS: replaces the old "Model file" card with its path box and
+            // Browse button. The main model is chosen from the added models.
+            SettingsCard(title = "Model") {
+                ModelPicker(
+                    label = "Main model (the chat model)",
+                    currentPath = draft.modelPath,
+                    models = storedModels,
+                    allowNone = false,
+                    onPick = { draft = draft.copy(modelPath = it) }
                 )
-                // Browse: open the file picker ("*/*" = show all file types,
-                // because Android does not know the .gguf type).
-                OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }) {
+                if (storedModels.isEmpty()) {
+                    Text(
+                        text = "No models added yet. Tap \"Manage models\" to add one.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(onClick = onManageModels) {
                     Icon(Icons.Outlined.FolderOpen, contentDescription = null,
                         modifier = Modifier.size(18.dp))
-                    Text("  Browse")
+                    Text("  Manage models")
                 }
-                if (browseMessage.isNotEmpty()) {
-                    Text(
-                        text = browseMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-
-            // ================= STORAGE STATUS =================
-            SettingsCard(title = "Storage Status") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable(onClick = onStorageClick),   // tap to grant access
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text("File access", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            text = "Internal shared storage",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    // Small badge: "Allowed" or "Tap to allow".
-                    Text(
-                        text = if (storageAllowed) "Allowed" else "Tap to allow",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (storageAllowed) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.error,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                    )
-                }
+                Text(
+                    text = "Adding, renaming and deleting models is done there. " +
+                            "Settings you changed here and did not save are lost when you leave.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             // ================= LOAD MODEL BUTTON =================
             // The button text follows the real engine status.
             // It is switched off while loading, while Gemma is answering,
-            // while Gemma is naming a chat (PHASE 3) and while Gemma is
-            // saving memories (PHASE 4).
+            // while Gemma is naming a chat (PHASE 3), while Gemma is saving
+            // memories (PHASE 4) and (MODELS) while no main model is chosen.
             Button(
                 onClick = { onLoadModel(draft) },
-                enabled = engineState != EngineManager.State.LOADING &&
+                enabled = mainExists &&
+                          engineState != EngineManager.State.LOADING &&
                           engineState != EngineManager.State.THINKING &&
                           engineState != EngineManager.State.NAMING &&
                           engineState != EngineManager.State.MEMORIZING,
@@ -672,6 +581,14 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.labelLarge
                 )
             }
+            // MODELS: say why the button is off.
+            if (!mainExists) {
+                Text(
+                    text = "Choose a main model above to load it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
             // If loading failed, show the plain-words reason right here.
             if (engineState == EngineManager.State.ERROR && EngineManager.errorMessage.isNotEmpty()) {
                 Text(
@@ -683,19 +600,16 @@ fun SettingsScreen(
 
             // ================= SYSTEM PROMPT EDITOR =================
             SettingsCard(title = "System Prompt Editor") {
-                OutlinedTextField(
+                // PROMPTS: folded to 6 lines; a tap opens the whole prompt.
+                ExpandablePromptField(
                     value = draft.systemPrompt,
                     onValueChange = {
                         // Accept the new text only while it is short enough.
                         if (it.length <= MAX_PROMPT_CHARS) draft = draft.copy(systemPrompt = it)
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Prompt") },
-                    minLines = 3,
-                    supportingText = {
-                        Text("Sent at the start of the context window.  " +
-                                "${draft.systemPrompt.length} / $MAX_PROMPT_CHARS")
-                    }
+                    label = "Prompt",
+                    hint = "Sent at the start of the context window.  " +
+                            "${draft.systemPrompt.length} / $MAX_PROMPT_CHARS"
                 )
                 OutlinedTextField(
                     value = draft.stopSequence,
@@ -734,22 +648,16 @@ fun SettingsScreen(
             //   {"personal": [{"n": 2, "tags": ["a", "b", "c", "d"]}]}
             // because the app reads exactly that.
             SettingsCard(title = "Memory Prompt Editor") {
-                OutlinedTextField(
+                // PROMPTS: folded to 6 lines; a tap opens the whole prompt.
+                ExpandablePromptField(
                     value = effectiveMemoryPrompt(draft),
                     onValueChange = {
                         if (it.length <= MAX_MEMORY_PROMPT_CHARS) draft = draft.copy(memoryPrompt = it)
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Prompt for finding personal messages and tags") },
-                    minLines = 8,
-                    maxLines = 16,
-                    supportingText = {
-                        Text(
-                            (if (draft.memoryPrompt.isBlank()) "Built-in prompt in use.  "
-                             else "Your edited prompt in use.  ") +
-                                    "${effectiveMemoryPrompt(draft).length} / $MAX_MEMORY_PROMPT_CHARS"
-                        )
-                    }
+                    label = "Prompt for finding personal messages and tags",
+                    hint = (if (draft.memoryPrompt.isBlank()) "Built-in prompt in use.  "
+                            else "Your edited prompt in use.  ") +
+                            "${effectiveMemoryPrompt(draft).length} / $MAX_MEMORY_PROMPT_CHARS"
                 )
                 Text(
                     text = "Keep the reply shape: {\"personal\": [{\"n\": 2, \"tags\": [\"a\", \"b\"]}]}. " +
@@ -795,53 +703,147 @@ private fun SettingsCard(
 }
 
 // ---------------------------------------------------------------------
-// STEP 7 HELPER: one model file chooser: a path box that says whether the
-// file exists, a Browse button, and a problem message under it.
-//   label         what the box is called
-//   path          the path now ("" = none chosen yet)
-//   onPathChange  the user typed in the box
-//   onBrowse      the Browse button was tapped (the caller opens the picker)
-//   message       a problem from the picker ("" = none)
+// MODELS HELPER: chooses ONE model from the models that were added.
+// It looks like a button with the chosen model's name and a small arrow;
+// tapping it opens a list.
+//   label         what the choice is called ("Main model", "Embedder"...)
+//   currentPath   the path now ("" = none chosen)
+//   models        the added models (the choices)
+//   allowNone     true = the list also has "None" (for the two search models;
+//                 the main model always needs a choice)
+//   onPick        the user chose a model (its path), or "" for None
+// Under the button a short red text says when nothing is chosen or when the
+// chosen file is gone (for example it was deleted, or it is the old path from
+// the version that needed "All files access").
 // It draws several things one after another; it is meant to be used inside
 // a SettingsCard (a Column), which spaces them.
 // ---------------------------------------------------------------------
 @Composable
-private fun ModelPathField(
+private fun ModelPicker(
     label: String,
-    path: String,
-    onPathChange: (String) -> Unit,
-    onBrowse: () -> Unit,
-    message: String
+    currentPath: String,
+    models: List<StoredModel>,
+    allowNone: Boolean,
+    onPick: (String) -> Unit
 ) {
-    // Does the file exist? (A quick check of one name, fine to do on screen.)
-    val exists = path.isNotBlank() && File(path).exists()
+    // Is the list open?
+    var open by remember { mutableStateOf(false) }
 
-    OutlinedTextField(
-        value = path,
-        onValueChange = onPathChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(label) },
-        singleLine = true,
-        isError = path.isNotBlank() && !exists,
-        supportingText = {
-            Text(
-                when {
-                    path.isBlank() -> "Not chosen yet."
-                    exists -> "File found."
-                    else -> "No file at this path."
+    val current = models.firstOrNull { it.path == currentPath }
+    val exists = currentPath.isNotBlank() && File(currentPath).exists()
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+
+        // The Box is the anchor the list opens at.
+        Box {
+            OutlinedButton(
+                onClick = { open = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = when {
+                        current != null -> current.displayName
+                        currentPath.isBlank() -> "Not chosen"
+                        exists -> File(currentPath).name
+                        else -> "Missing: " + File(currentPath).name
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+            }
+            DropdownMenu(
+                expanded = open,
+                onDismissRequest = { open = false }
+            ) {
+                if (allowNone) {
+                    DropdownMenuItem(
+                        text = { Text("None") },
+                        onClick = {
+                            open = false
+                            onPick("")
+                        }
+                    )
                 }
+                models.forEach { model ->
+                    DropdownMenuItem(
+                        text = { Text(model.displayName + "  (" + ModelStore.formatSize(model.sizeBytes) + ")") },
+                        onClick = {
+                            open = false
+                            onPick(model.path)
+                        }
+                    )
+                }
+                if (models.isEmpty()) {
+                    DropdownMenuItem(
+                        text = { Text("No models added yet") },
+                        enabled = false,
+                        onClick = { }
+                    )
+                }
+            }
+        }
+
+        // A problem text under the button (nothing when all is fine).
+        val problem = when {
+            currentPath.isBlank() -> if (allowNone) "" else "Not chosen yet."
+            !exists -> "This file was not found. Choose a model from the list."
+            else -> ""
+        }
+        if (problem.isNotEmpty()) {
+            Text(
+                text = problem,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
             )
         }
-    )
-    OutlinedButton(onClick = onBrowse) {
-        Icon(Icons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-        Text("  Browse")
     }
-    if (message.isNotEmpty()) {
-        Text(
-            text = message,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error
-        )
+}
+
+// ---------------------------------------------------------------------
+// PROMPTS HELPER: a text box for a LONG prompt.
+//   - Folded: it shows only COLLAPSED_PROMPT_LINES (6) lines. A longer text
+//     scrolls inside the box, so the Settings page stays short.
+//   - A tap on the box gives it the focus, which OPENS it: the whole prompt
+//     is shown (and the user can edit it).
+//   - "Show less" folds it again and removes the focus (the keyboard closes).
+//   value / onValueChange  the text and its changes (the caller limits the length)
+//   label                  the small title of the box
+//   hint                   the line under the box (for example the character count)
+// ---------------------------------------------------------------------
+@Composable
+private fun ExpandablePromptField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    hint: String
+) {
+    // Is the box open (whole text) or folded (6 lines)?
+    var expanded by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier
+            .fillMaxWidth()
+            // The first tap puts the cursor in the box (focus): open it.
+            .onFocusChanged { if (it.isFocused) expanded = true },
+        label = { Text(label) },
+        minLines = 3,
+        maxLines = if (expanded) Int.MAX_VALUE else COLLAPSED_PROMPT_LINES,
+        supportingText = { Text(hint) }
+    )
+    if (expanded) {
+        TextButton(
+            onClick = {
+                expanded = false
+                focusManager.clearFocus()
+            }
+        ) {
+            Text("Show less")
+        }
     }
 }

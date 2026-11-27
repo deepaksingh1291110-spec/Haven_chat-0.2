@@ -24,6 +24,23 @@
 //     keeps the right reply reserve when it puts the open chat back
 //     (1000 tokens with thinking, 500 without).
 //   - "Engine busy" now also covers NAMING (Gemma writing a chat title).
+//
+// PRIVATE MODELS (marked "MODELS"): MODEL MANAGEMENT.
+//   The Model management screen (ModelsViewModel) changes which model file
+//   has which role (main, embedder, reranker). Those roles are the three
+//   paths in AppSettings. So this class got ONE new function:
+//     applySettings(newSettings, reload)
+//   It does what saveSettings() did (use the settings, save them on the
+//   phone), but the caller decides whether the MAIN model is loaded again:
+//     - reload = true  : the main model path changed (or the file was
+//                        renamed): load it again.
+//     - reload = false : only the embedder or reranker path changed. Nothing
+//                        has to be loaded (they are loaded only while a deep
+//                        search runs), and the chat model is left alone.
+//   saveSettings() is now just applySettings(newSettings, reload = true).
+//   Also new: loadModel() says so in plain words when NO model is chosen
+//   (a blank path), instead of the engine's "file not found:" with nothing
+//   after it.
 // =====================================================================
 package com.haven.chat.ui.settings
 
@@ -96,7 +113,20 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     // Called when the user taps "Save & Reload" (and by "Load Model").
+    // MODELS: the same as applySettings with reload = true.
     fun saveSettings(newSettings: AppSettings) {
+        applySettings(newSettings, reload = true)
+    }
+
+    /**
+     * MODELS (NEW): uses the new settings and saves them on the phone.
+     *   reload = true   the MAIN model is loaded again with them (needed when
+     *                   the model path, threads, context size... changed).
+     *   reload = false  nothing is loaded (for example only the embedder or
+     *                   reranker path changed).
+     * Used by saveSettings() and by the Model management screen.
+     */
+    fun applySettings(newSettings: AppSettings, reload: Boolean) {
         settings = newSettings
         active = newSettings
 
@@ -112,7 +142,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
 
         // New threads / context size / prompt only count after a reload.
-        loadModel()
+        if (reload) loadModel()
     }
 
     // Called when the user taps "Load Model" (and by the status chip).
@@ -126,6 +156,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
         val s = settings
         active = s
+
+        // MODELS: no model chosen at all (a new install, or the chosen model
+        // was deleted). Say it in plain words; the engine would only say
+        // "file not found:" with an empty name.
+        if (s.modelPath.isBlank()) {
+            loadMessage = "No model is chosen. Open Model management and add or choose one."
+            return
+        }
         loadMessage = ""
 
         // EngineManager loads on a background thread and calls us back

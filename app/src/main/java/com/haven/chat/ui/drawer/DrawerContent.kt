@@ -49,6 +49,13 @@
 //   screen, where the saved memories can be seen, edited and deleted.
 //   Both new callbacks have a default value ({}), so this file compiles
 //   even before HavenApp.kt passes them.
+//
+// PRIVATE MODELS (marked "MODELS"):
+//   The row "Model management" (it did nothing before) now calls
+//   onModelsClick. HavenApp closes the drawer and opens the model
+//   management screen, where the user adds, renames, deletes and chooses
+//   models. The new callback has a default value ({}), like the others.
+//   Nothing else in this file changed.
 // =====================================================================
 package com.haven.chat.ui.drawer
 
@@ -135,6 +142,7 @@ fun DrawerContent(
     onSaveAndDeleteChat: (Long) -> Unit = {}, // PHASE 4: chat id (after the user chose "Save personal things, then delete")
     onSettingsClick: () -> Unit,
     onPrivacyClick: () -> Unit = {},     // PHASE 4: the "Privacy & local data" row was tapped
+    onModelsClick: () -> Unit = {},      // MODELS: the "Model management" row was tapped
     onCloseClick: () -> Unit
 ) {
     // Group by section name ("Today", "Yesterday"...). Result: Map<name, list>.
@@ -258,7 +266,8 @@ fun DrawerContent(
                 modifier = Modifier.padding(top = 24.dp, bottom = 8.dp)
             )
             PreferenceRow(Icons.Outlined.Settings, "Settings", onSettingsClick)
-            PreferenceRow(Icons.Outlined.Memory, "Model management") { /* TODO later */ }
+            // MODELS: this row works now (it opens the model management screen).
+            PreferenceRow(Icons.Outlined.Memory, "Model management", onModelsClick)
             // PHASE 4: this row works now (it opens the memories screen).
             PreferenceRow(Icons.Outlined.Shield, "Privacy & local data", onPrivacyClick)
             PreferenceRow(Icons.Outlined.Storage, "Storage & cache") { /* TODO later */ }

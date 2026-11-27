@@ -1,13 +1,11 @@
 // =====================================================================
 // HavenApp.kt  (app/src/main/java/com/haven/chat/ui/)
 // WHAT: The ROOT of the whole app UI. It joins everything:
-//         - three pages with navigation: "chat", "settings" and "privacy"
+//         - four pages with navigation: "chat", "settings", "privacy" and
+//           "models"
 //         - the side drawer, which slides over the chat page
-//         - the ViewModels (chat data, settings data, memories data)
+//         - the ViewModels (chat data, settings data, memories data, models)
 // WHO CALLS IT: MainActivity calls HavenApp() once.
-// STORAGE PERMISSION: Only an Activity can check or ask for "All files
-//   access". So MainActivity does that and hands us two things:
-//   storageAllowed (true/false) and onRequestStorageAccess (a function).
 //
 // PHASE 2 CHANGES:
 //   - Tapping the status chip in the chat loads the model when it is
@@ -15,7 +13,6 @@
 //   - The "Load Model" button in Settings now hands over the settings
 //     that are on screen: they are saved and the model is loaded. We
 //     stay on the Settings page so the button text can be watched.
-//   - The Browse file picker now lives inside SettingsScreen.
 //   - Stop button: ChatScreen gets isGenerating (read from the engine
 //     state) and onStop (calls chatViewModel.stopGenerating()).
 //
@@ -58,6 +55,27 @@
 //   - The privacy page now also edits the TAGS of a memory:
 //     onUpdateMemory gives (id, question, answer, tags) and goes straight
 //     to PrivacyViewModel.updateMemory.
+//
+// PRIVATE MODELS (marked "MODELS"): NO MORE "ALL FILES ACCESS".
+//   The app no longer reads models from a normal phone folder. They live in
+//   the app's private space (ModelStore) and are managed on a new page:
+//   - A fourth page "models" (ModelsScreen). The drawer row "Model
+//     management" closes the drawer and opens it. The page has its own
+//     ViewModel (ModelsViewModel), created when the page is opened. It is
+//     told about the settings with bind(settingsViewModel), because the
+//     roles (main model, embedder, reranker) are saved in the settings.
+//   - The two storage-permission parameters of HavenApp are gone
+//     (storageAllowed, onRequestStorageAccess): MainActivity does not ask
+//     for the permission any more.
+//   - FIRST START: when the chosen main model file does not exist (a new
+//     install, or the old path from the older version), the models page is
+//     opened ONCE automatically, so the user can add a model right away.
+//     (After that the user goes there from the drawer.)
+//   - The status chip: when the model is not loaded and its file does not
+//     exist, tapping the chip opens the models page instead of showing an
+//     error.
+//   - The Settings page gets onManageModels (a button there opens the models
+//     page) and no longer gets the storage parameters.
 // =====================================================================
 package com.haven.chat.ui
 
@@ -68,6 +86,7 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -83,22 +102,23 @@ import com.haven.chat.engine.EngineManager
 import com.haven.chat.ui.chat.ChatScreen
 import com.haven.chat.ui.chat.ChatViewModel
 import com.haven.chat.ui.drawer.DrawerContent
+import com.haven.chat.ui.models.ModelsScreen
+import com.haven.chat.ui.models.ModelsViewModel
 import com.haven.chat.ui.privacy.PrivacyScreen
 import com.haven.chat.ui.privacy.PrivacyViewModel
 import com.haven.chat.ui.settings.SettingsScreen
 import com.haven.chat.ui.settings.SettingsViewModel
 import kotlinx.coroutines.launch
+import java.io.File
 
 // Names of our pages. Using constants avoids typos.
 private const val ROUTE_CHAT = "chat"
 private const val ROUTE_SETTINGS = "settings"
 private const val ROUTE_PRIVACY = "privacy"      // PHASE 4 / PRIVACY
+private const val ROUTE_MODELS = "models"        // MODELS
 
 @Composable
-fun HavenApp(
-    storageAllowed: Boolean,                 // is "All files access" granted?
-    onRequestStorageAccess: () -> Unit       // open the phone's permission page
-) {
+fun HavenApp() {
     // The navigator: remembers which page is open and the back stack.
     val navController = rememberNavController()
 
@@ -117,6 +137,22 @@ fun HavenApp(
     // PHASE 3: the text in the drawer's search box. rememberSaveable keeps
     // it when the phone rotates or when we come back from Settings.
     var searchText by rememberSaveable { mutableStateOf("") }
+
+    // MODELS: has the app already sent the user to the models page on its
+    // own? rememberSaveable keeps the answer when the phone rotates, so the
+    // page is not opened a second time.
+    var askedForModel by rememberSaveable { mutableStateOf(false) }
+
+    // MODELS: FIRST START. Runs once when the app UI appears. If the chosen
+    // main model file does not exist (new install, or the old path of the
+    // version that needed "All files access"), open the models page so the
+    // user can add a model right away.
+    LaunchedEffect(Unit) {
+        if (!askedForModel && !File(settingsViewModel.settings.modelPath).exists()) {
+            askedForModel = true
+            navController.navigate(ROUTE_MODELS)
+        }
+    }
 
     // NavHost = the area that shows the current page.
     NavHost(navController = navController, startDestination = ROUTE_CHAT) {
@@ -186,6 +222,11 @@ fun HavenApp(
                                 scope.launch { drawerState.close() }
                                 navController.navigate(ROUTE_PRIVACY)
                             },
+                            // MODELS: open the model management screen.
+                            onModelsClick = {
+                                scope.launch { drawerState.close() }
+                                navController.navigate(ROUTE_MODELS)
+                            },
                             onCloseClick = {
                                 scope.launch { drawerState.close() }
                             }
@@ -206,10 +247,16 @@ fun HavenApp(
                     // it is not loaded (or the last load failed). In the
                     // states Loading, Ready, Thinking, Naming and Memorizing
                     // a tap does nothing.
+                    // MODELS: when the chosen model file does not exist, there
+                    // is nothing to load: open the models page instead.
                     onStatusClick = {
                         val s = EngineManager.state
                         if (s == EngineManager.State.NOT_LOADED || s == EngineManager.State.ERROR) {
-                            settingsViewModel.loadModel()
+                            if (File(settingsViewModel.settings.modelPath).exists()) {
+                                settingsViewModel.loadModel()
+                            } else {
+                                navController.navigate(ROUTE_MODELS)
+                            }
                         }
                     },
                     // Stop button: while Gemma is busy (reading, thinking or
@@ -235,7 +282,6 @@ fun HavenApp(
         composable(ROUTE_SETTINGS) {
             SettingsScreen(
                 initial = settingsViewModel.settings,
-                storageAllowed = storageAllowed,
                 onBack = { navController.popBackStack() },
                 onSaveAndReload = { newSettings ->
                     settingsViewModel.saveSettings(newSettings)
@@ -245,7 +291,9 @@ fun HavenApp(
                 // (saveSettings stores the settings AND loads the model.)
                 // We stay on this page so the button can show "Loading...".
                 onLoadModel = { draft -> settingsViewModel.saveSettings(draft) },
-                onStorageClick = onRequestStorageAccess
+                // MODELS: the "Manage models" button in Settings. (Unsaved
+                // edits on the Settings page are not kept when leaving it.)
+                onManageModels = { navController.navigate(ROUTE_MODELS) }
             )
         }
 
@@ -270,6 +318,22 @@ fun HavenApp(
                 onDeleteMemory = { id -> privacyViewModel.deleteMemory(id) },
                 onDeleteAll = { privacyViewModel.deleteAllMemories() },
                 onClearProblem = { privacyViewModel.clearProblem() }
+            )
+        }
+
+        // ================= PAGE 4: MODEL MANAGEMENT =================
+        // MODELS: the models in the app's private space. The ViewModel is
+        // created here, when the page is opened (it belongs to this page
+        // only). bind() tells it where the settings are, because the roles
+        // (main model, embedder, reranker) are saved there. Calling bind()
+        // again on a redraw is harmless: it only stores the reference.
+        composable(ROUTE_MODELS) {
+            val modelsViewModel: ModelsViewModel = viewModel()
+            modelsViewModel.bind(settingsViewModel)
+
+            ModelsScreen(
+                vm = modelsViewModel,
+                onBack = { navController.popBackStack() }
             )
         }
     }

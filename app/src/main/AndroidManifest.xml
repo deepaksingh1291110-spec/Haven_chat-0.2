@@ -4,21 +4,19 @@
   AndroidManifest.xml  (app/src/main/)
   WHAT: The app's "ID card" for Android. It says what the app is called,
         which screen opens first, and which permissions it needs.
+
+  PRIVATE MODELS: THE APP NEEDS NO PERMISSIONS ANY MORE.
+        Before, this file asked for "All files access"
+        (MANAGE_EXTERNAL_STORAGE) and READ_EXTERNAL_STORAGE, because the
+        model files (GGUF) were read from a normal phone folder. The Play
+        Store does not like that permission.
+        Now the user adds a model with Android's own file picker, and the
+        app COPIES it into its private space (see ModelStore.kt). The
+        picker gives the app access to the ONE file the user chose, and the
+        private folder needs no permission. So both permissions are gone.
   =====================================================================
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!-- PERMISSION: read model files (GGUF) from a normal phone folder,
-         for example /storage/emulated/0/HavenModels/.
-         Android 10 and older use READ_EXTERNAL_STORAGE. -->
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-
-    <!-- PERMISSION: "All files access" for Android 11 and newer.
-         The user turns it on once in phone settings. This is what your
-         Settings screen means by "Storage Status: Allowed". -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:label="Haven Chat"
@@ -32,8 +30,8 @@
              inside MainActivity, so we do not need a custom XML theme. -->
 
         <!-- MainActivity = the one and only Android "screen" (Activity).
-             All our screens (chat, drawer, settings) live INSIDE it as
-             Compose screens. -->
+             All our screens (chat, drawer, settings, privacy, models) live
+             INSIDE it as Compose screens. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
