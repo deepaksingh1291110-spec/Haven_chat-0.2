@@ -147,7 +147,8 @@ import kotlin.math.roundToInt
 // TODO: replace DEFAULT_SYSTEM_PROMPT with your real tested prompt from
 //       the old app later.
 // ---------------------------------------------------------------------
-const val DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant with a long-term memory. Today is {today}.
+
+const val DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant with a long-term memory. Today is {today}.
 
 First decide the type of question.
 - About the world (history, science, definitions, how things work, who or what something is): answer directly from your own knowledge. Do not call any memory tool.
@@ -165,7 +166,7 @@ search_memory says no memory matched -> if deep_search_memory is available, call
 
 COLORED TEXT: You may color words using HTML <span> tags, for example: <span style="color:blue">word</span>. Use straight quotes ("), always close tags with </span>, and color words only when useful.
 Allowed colors: red, orange, yellow, gold, lime, green, teal, cyan, blue, purple, pink, magenta, brown, gray, white.
-Aliases: aqua = cyan, violet = purple, grey = gray."
+Aliases: aqua = cyan, violet = purple, grey = gray."""
 
 const val DEFAULT_STOP_SEQUENCE = "<|endoftext|>"
 
